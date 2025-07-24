@@ -100,6 +100,9 @@ Thumbs.db
 Industrial_Tech_College_Prep_Workbook/
 Industrial_Tech_KICE_June_Sept_Exams/
 
+# Gemini API 응답 데이터 (저작권 문제 가능성)
+make-dataset/gemini_responses_from_flash/
+
 # 변환된 이미지들 (원본에서 파생된 콘텐츠)
 images/
 *.png
