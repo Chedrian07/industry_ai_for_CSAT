@@ -103,8 +103,11 @@ Industrial_Tech_KICE_June_Sept_Exams/
 # Gemini API 응답 데이터 (저작권 문제 가능성)
 make-dataset/gemini_responses_from_flash/
 make-dataset/combine_from_gemini_flash.jsonl
+make-dataset/chapters_only_from_gemini_flash.jsonl
+make-dataset/exams_only_from_gemini_flash.jsonl
 
 # 변환된 이미지들 (원본에서 파생된 콘텐츠)
+make-dataset/images/
 images/
 *.png
 *.jpg
@@ -123,11 +126,29 @@ images/
 
 # 데이터셋 파일들 (민감할 수 있음)
 *.jsonl
-.json
+*.json
 *.csv
 *.tsv
 *.xlsx
 *.xls
+
+# 데이터셋 디렉토리 전체
+dataset/
+data/
+datasets/
+
+# 훈련 관련 출력 파일들
+output/
+outputs/
+checkpoints/
+models/
+trained_models/
+fine_tuned_models/
+
+# MLX 관련 캐시 및 변환된 모델들
+*.mlx
+mlx_models/
+converted_models/
 
 # API 키나 설정 파일들
 config.json
@@ -140,6 +161,12 @@ credentials.json
 .cache/
 cache/
 __cache__/
+.huggingface/
+huggingface_cache/
+
+# MLX 관련 임시 파일들
+*.npy
+*.npz
 
 # Node.js (만약 사용한다면)
 node_modules/

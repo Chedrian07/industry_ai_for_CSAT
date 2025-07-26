@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+Gemini 응답을 LLM 파인튜닝용 Chat 형식으로 변환하는 스크립트
+
+사용법:
+    python convert_data_selective.py [all|chapters_only|exams_only]
+    
+    - all: 모든 파일 처리 (기본값)
+    - chapters_only: Chapter_{number}.json 파일들만 처리 (test 제외)
+    - exams_only: CSAT_EXAM과 test 파일들만 처리
+"""
+
 import os
 import json
 import glob
@@ -9,11 +21,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class GeminiToChatFormatConverter:
-    def __init__(self):
-        """Gemini 응답을 Chat 형식으로 변환하는 클래스"""
+    def __init__(self, output_type="all"):
+        """
+        Gemini 응답을 Chat 형식으로 변환하는 클래스
+        
+        Args:
+            output_type: "all", "chapters_only", "exams_only" 중 선택
+        """
         self.base_dir = Path(__file__).parent
         self.input_dir = self.base_dir / "gemini_responses_from_flash"
-        self.output_file = self.base_dir / "combine_from_gemini_flash.jsonl"
+        self.output_type = output_type
+        
+        # 출력 파일명 설정
+        if output_type == "chapters_only":
+            self.output_file = self.base_dir / "chapters_only_from_gemini_flash.jsonl"
+        elif output_type == "exams_only":
+            self.output_file = self.base_dir / "exams_only_from_gemini_flash.jsonl"
+        else:
+            self.output_file = self.base_dir / "combine_from_gemini_flash.jsonl"
         
     def load_json_file(self, file_path):
         """JSON 파일 로드"""
@@ -156,7 +181,11 @@ class GeminiToChatFormatConverter:
                 if isinstance(item, dict):
                     # 이미 chat 형식인 경우 (messages 키가 있는 경우)
                     if "messages" in item:
-                        chat_data_list.append(item)
+                        # 순수한 messages 형식으로 정리 (다른 메타데이터 제거)
+                        clean_chat = {
+                            "messages": item["messages"]
+                        }
+                        chat_data_list.append(clean_chat)
                     else:
                         # 문제 형식인 경우 변환
                         converted_chats = self.convert_problem_to_chat(item)
@@ -165,61 +194,109 @@ class GeminiToChatFormatConverter:
         logger.info(f"  📊 변환 결과: {len(chat_data_list)}개 chat 데이터 생성")
         return chat_data_list
     
-    def get_processing_order(self):
-        """파일 처리 순서 결정 (Chapter -> CSAT_EXAM 순)"""
+    def get_filtered_files(self):
+        """출력 타입에 따라 파일 필터링"""
         json_files = list(self.input_dir.glob("*.json"))
         
-        # Chapter 파일들과 CSAT 파일들 분리
-        chapter_files = []
-        csat_files = []
-        
-        for file_path in json_files:
-            if file_path.name.startswith("Chapter_"):
-                chapter_files.append(file_path)
-            elif "CSAT_EXAM" in file_path.name:
-                csat_files.append(file_path)
-        
-        # Chapter 파일들 정렬 (숫자 순)
-        def extract_chapter_number(filename):
+        if self.output_type == "chapters_only":
+            # Chapter_{number}.json 파일들만 (test 제외)
+            filtered_files = [
+                f for f in json_files 
+                if f.name.startswith("Chapter_") and not f.name.endswith("_test.json")
+            ]
+            # 챕터 번호 순으로 정렬
+            def extract_chapter_number(filename):
+                import re
+                match = re.search(r'Chapter_(\d+)\.json$', filename)
+                if match:
+                    return int(match.group(1))
+                return 999
+            
+            filtered_files.sort(key=lambda x: extract_chapter_number(x.name))
+            
+        elif self.output_type == "exams_only":
+            # CSAT_EXAM과 test 파일들만
+            filtered_files = [
+                f for f in json_files 
+                if "CSAT_EXAM" in f.name or f.name.endswith("_test.json")
+            ]
+            # 날짜와 타입 순으로 정렬
             import re
-            match = re.search(r'Chapter_(\d+)', filename)
-            if match:
-                return int(match.group(1))
-            return 999
+            def sort_key(file_path):
+                filename = file_path.name
+                if "CSAT_EXAM" in filename:
+                    match = re.search(r'(\d{2})_(\d{2})_CSAT_EXAM', filename)
+                    if match:
+                        year, month = int(match.group(1)), int(match.group(2))
+                        return (0, year, month, filename)  # CSAT가 먼저
+                elif filename.endswith("_test.json"):
+                    match = re.search(r'Chapter_(\d+)_test', filename)
+                    if match:
+                        chapter_num = int(match.group(1))
+                        return (1, chapter_num, 0, filename)  # test가 나중에
+                return (2, 999, 0, filename)
+            
+            filtered_files.sort(key=sort_key)
+            
+        else:  # "all"
+            # 모든 파일 (기존 로직)
+            chapter_files = []
+            csat_files = []
+            
+            for file_path in json_files:
+                if file_path.name.startswith("Chapter_"):
+                    chapter_files.append(file_path)
+                elif "CSAT_EXAM" in file_path.name:
+                    csat_files.append(file_path)
+            
+            # Chapter 파일들 정렬 (숫자 순)
+            def extract_chapter_number(filename):
+                import re
+                match = re.search(r'Chapter_(\d+)', filename)
+                if match:
+                    return int(match.group(1))
+                return 999
+            
+            chapter_files.sort(key=lambda x: (extract_chapter_number(x.name), x.name))
+            
+            # CSAT 파일들 정렬 (연도_월 순)
+            def extract_csat_date(filename):
+                import re
+                match = re.search(r'(\d{2})_(\d{2})_CSAT_EXAM', filename)
+                if match:
+                    year, month = int(match.group(1)), int(match.group(2))
+                    return (year, month)
+                return (99, 99)
+            
+            csat_files.sort(key=lambda x: extract_csat_date(x.name))
+            
+            filtered_files = chapter_files + csat_files
         
-        chapter_files.sort(key=lambda x: (extract_chapter_number(x.name), x.name))
-        
-        # CSAT 파일들 정렬 (연도_월 순)
-        def extract_csat_date(filename):
-            import re
-            match = re.search(r'(\d{2})_(\d{2})_CSAT_EXAM', filename)
-            if match:
-                year, month = int(match.group(1)), int(match.group(2))
-                return (year, month)
-            return (99, 99)
-        
-        csat_files.sort(key=lambda x: extract_csat_date(x.name))
-        
-        processing_order = chapter_files + csat_files
-        
-        logger.info(f"📋 처리 순서 ({len(processing_order)}개 파일):")
-        for i, file_path in enumerate(processing_order, 1):
-            logger.info(f"  {i:2d}. {file_path.name}")
-        
-        return processing_order
+        return filtered_files
     
     def convert_all_files(self):
         """모든 파일을 처리하여 JSONL 형식으로 저장"""
-        processing_order = self.get_processing_order()
+        filtered_files = self.get_filtered_files()
         all_chat_data = []
         
+        # 타입별 로그 메시지
+        type_messages = {
+            "all": "🚀 모든 Gemini 응답을 Chat 형식으로 변환 시작",
+            "chapters_only": "📚 Chapter 파일들만 Chat 형식으로 변환 시작 (test 제외)",
+            "exams_only": "📝 시험 파일들만 Chat 형식으로 변환 시작 (CSAT + test)"
+        }
+        
         logger.info(f"\n{'='*70}")
-        logger.info(f"🚀 Gemini 응답을 Chat 형식으로 변환 시작")
+        logger.info(type_messages.get(self.output_type, "🚀 변환 시작"))
         logger.info(f"{'='*70}")
         
-        total_files = len(processing_order)
+        logger.info(f"📋 처리할 파일 목록 ({len(filtered_files)}개):")
+        for i, file_path in enumerate(filtered_files, 1):
+            logger.info(f"  {i:2d}. {file_path.name}")
         
-        for i, file_path in enumerate(processing_order, 1):
+        total_files = len(filtered_files)
+        
+        for i, file_path in enumerate(filtered_files, 1):
             logger.info(f"\n📂 [{i:2d}/{total_files}] {file_path.name} 처리 중...")
             logger.info(f"{'─'*50}")
             
@@ -269,7 +346,7 @@ class GeminiToChatFormatConverter:
                 system_messages[key] = system_messages.get(key, 0) + 1
         
         logger.info(f"\n{'='*70}")
-        logger.info(f"📊 변환 결과 통계")
+        logger.info(f"📊 변환 결과 통계 ({self.output_type})")
         logger.info(f"{'='*70}")
         logger.info(f"🔢 총 채팅 데이터 수: {total_chats:,}개")
         logger.info(f"\n📋 채팅 유형별 분포:")
@@ -288,7 +365,44 @@ class GeminiToChatFormatConverter:
 
 def main():
     """메인 실행 함수"""
-    converter = GeminiToChatFormatConverter()
+    import sys
+    
+    # 사용법 출력
+    def print_usage():
+        print("=" * 70)
+        print("🤖 Gemini 응답을 LLM 파인튜닝용 Chat 형식으로 변환")
+        print("=" * 70)
+        print("\n📖 사용법:")
+        print("  python convert_gemini_to_chat.py [옵션]")
+        print("\n🔧 옵션:")
+        print("  all           - 모든 파일 처리 (기본값)")
+        print("  chapters_only - Chapter_{number}.json 파일들만 처리 (test 제외)")  
+        print("  exams_only    - CSAT_EXAM과 test 파일들만 처리")
+        print("\n📁 출력 파일:")
+        print("  all           → combine_from_gemini_flash.jsonl")
+        print("  chapters_only → chapters_only_from_gemini_flash.jsonl")
+        print("  exams_only    → exams_only_from_gemini_flash.jsonl")
+        print("\n💡 예시:")
+        print("  python convert_gemini_to_chat.py")
+        print("  python convert_gemini_to_chat.py chapters_only")
+        print("  python convert_gemini_to_chat.py exams_only")
+        print()
+    
+    # 명령행 인수 처리
+    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help', 'help']:
+        print_usage()
+        return
+    
+    output_type = "all"
+    if len(sys.argv) > 1:
+        output_type = sys.argv[1]
+    
+    if output_type not in ["all", "chapters_only", "exams_only"]:
+        print("❌ 잘못된 옵션입니다.")
+        print_usage()
+        return
+    
+    converter = GeminiToChatFormatConverter(output_type=output_type)
     
     try:
         # 입력 디렉토리 확인
@@ -301,6 +415,7 @@ def main():
         
         logger.info(f"\n🎉 변환 작업이 성공적으로 완료되었습니다!")
         logger.info(f"💾 결과 파일: {converter.output_file}")
+        logger.info(f"📊 총 데이터 수: {len(chat_data):,}개")
         
     except KeyboardInterrupt:
         logger.info(f"\n⚠️ 사용자에 의해 작업이 중단되었습니다.")
