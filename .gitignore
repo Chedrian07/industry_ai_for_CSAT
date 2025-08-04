@@ -111,7 +111,6 @@ make-dataset/exams_only_from_gemini_flash.jsonl
 # 변환된 이미지들 (원본에서 파생된 콘텐츠)
 make-dataset/images/
 images/
-*.png
 *.jpg
 *.jpeg
 *.gif
