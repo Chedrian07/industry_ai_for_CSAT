@@ -8,6 +8,8 @@ venv.bak/
 .venv/
 .virtualenv/
 pyvenv.cfg
+.fused_model/
+mlx_model
 
 # Python
 __pycache__/

@@ -1,985 +1,1146 @@
 import os
 import json
-import glob
 import time
-import re
-from pathlib import Path
-from datetime import datetime
+import argparse
 import google.generativeai as genai
-from PIL import Image
-import logging
+from pathlib import Path
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Gemini API 설정 (API 키가 있을 때만)
+if "GEMINI_API_KEY" in os.environ:
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-class GeminiDatasetCreator:
-    def __init__(self):
-        """Gemini API를 사용한 데이터셋 생성기 초기화"""
-        self.setup_gemini()
-        self.base_dir = Path(__file__).parent
-        self.images_dir = self.base_dir / "images"
-        self.output_dir = self.base_dir / "gemini_responses"
-        self.output_dir.mkdir(exist_ok=True)
+class DatasetGenerator:
+    def __init__(self, model_type="pro", debug=False):
+        # API 키 확인
+        if "GEMINI_API_KEY" not in os.environ:
+            raise KeyError("GEMINI_API_KEY")
         
-        # 루트의 참조 이미지 로드
-        self.reference_image = self.load_reference_image()
+        # 모델 선택 (pro 또는 flash)
+        if model_type == "flash":
+            self.model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+            print("🚀 Gemini 2.5 Flash Thinking 모델 사용")
+        else:
+            self.model = genai.GenerativeModel('gemini-2.5-pro')
+            print("💎 Gemini 2.5 pro 모델 사용")
         
-    def setup_gemini(self):
-        """Gemini API 설정"""
-        api_key = os.getenv('GEMINI_API_KEY')
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+        self.base_path = Path("Industrial_Tech_College_Prep_Workbook")
+        self.response_path = Path("gemini_response")
+        self.response_path.mkdir(exist_ok=True)
+        self.debug = debug
         
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
-        logger.info("✅ Gemini API 설정 완료")
+        # 업로드된 파일들을 추적하기 위한 딕셔너리
+        self.uploaded_files = self.load_uploaded_files()
+        
+        # 답지 PDF를 저장할 변수 (한 번만 업로드)
+        self.answer_sheet_file = None
     
-    def load_reference_image(self):
-        """루트에 있는 참조 이미지 로드"""
-        reference_path = self.images_dir / "page_001.png"
-        
-        if not reference_path.exists():
-            logger.warning(f"⚠️  참조 이미지를 찾을 수 없습니다: {reference_path}")
-            return None
-        
-        try:
-            reference_image = Image.open(reference_path)
-            logger.info(f"📋 참조 이미지 로드 완료: {reference_path.name}")
-            return reference_image
-        except Exception as e:
-            logger.error(f"❌ 참조 이미지 로드 실패: {str(e)}")
-            return None
+    def load_uploaded_files(self):
+        """이전에 업로드된 파일들의 정보를 로드"""
+        uploaded_files_path = Path(".gemini_uploaded_files.json")
+        if uploaded_files_path.exists():
+            with open(uploaded_files_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
     
-    def get_processing_order(self):
-        """처리할 디렉토리들의 순서 결정"""
-        processing_order = []
-        
-        # 1. Chapter 디렉토리들 (1-20 순서로, 각 챕터마다 일반->test 순)
-        for i in range(1, 21):
-            chapter_dir = f"Chapter_{i}"
-            chapter_test_dir = f"Chapter_{i}_test"
-            
-            if (self.images_dir / chapter_dir).exists():
-                processing_order.append(chapter_dir)
-            if (self.images_dir / chapter_test_dir).exists():
-                processing_order.append(chapter_test_dir)
-        
-        # 2. CSAT_EXAM 디렉토리들 (연도_월 순서로 정렬)
-        csat_pattern = re.compile(r'(\d{2})_(\d{2})_CSAT_EXAM')
-        csat_dirs = []
-        
-        for item in self.images_dir.iterdir():
-            if item.is_dir() and csat_pattern.match(item.name):
-                match = csat_pattern.match(item.name)
-                year = int(match.group(1))
-                month = int(match.group(2))
-                csat_dirs.append((year, month, item.name))
-        
-        # 연도, 월 순으로 정렬
-        csat_dirs.sort(key=lambda x: (x[0], x[1]))
-        processing_order.extend([item[2] for item in csat_dirs])
-        
-        logger.info(f"📋 처리 순서 ({len(processing_order)}개 디렉토리):")
-        for i, dir_name in enumerate(processing_order, 1):
-            logger.info(f"  {i:2d}. {dir_name}")
-        
-        return processing_order
+    def save_uploaded_files(self):
+        """업로드된 파일들의 정보를 저장"""
+        with open(".gemini_uploaded_files.json", 'w', encoding='utf-8') as f:
+            json.dump(self.uploaded_files, f, ensure_ascii=False, indent=2)
     
-    def get_prompt_template(self, directory_type):
-        """디렉토리 타입에 따른 프롬프트 템플릿"""
-        base_prompt = """
-이 이미지들을 분석하여 다음 조건에 따라 JSON 형식으로 데이터를 추출해주세요.
-
-**참조: 첫 번째 이미지는 전체 문서의 구조와 맥락을 이해하기 위한 참조 이미지입니다. 이를 바탕으로 나머지 이미지들의 내용을 분석해주세요.**
-
-**🔍 답안지 확인 및 활용 방법:**
-1. **답안지 우선 확인**: 이미지 중에 "정답표", "답안지", "answer key", "해설", "정답과 해설" 등이 포함된 이미지가 있는지 먼저 확인하세요.
-2. **답안지 구조 파악**: 답안지에서 문항번호와 정답번호의 매칭표를 정확히 읽어내세요.
-3. **해설 내용 확인**: 답안지에 해설이나 풀이 과정이 포함되어 있다면 그 내용도 함께 확인하세요.
-4. **문제-정답-해설 매칭**: 각 문제 페이지의 문항과 답안지의 정답, 해설을 정확히 연결하세요.
-5. **정답 검증**: 답안지에 명시된 정답이 해당 문제의 선택지와 일치하는지 확인하세요.
-
-**중요 지침:**
-1. 한 페이지에 여러 문제나 개념이 있다면 각각을 별도의 JSON 객체로 반환하세요.
-2. **표, 분류표, 도표가 있는 경우 반드시 모든 세부 내용을 포함하세요.**
-3. **분류 코드, 번호, 기호 등도 정확히 추출하세요.**
-4. **예시, 사례, 구체적인 수치나 데이터가 있으면 모두 포함하세요.**
-5. **개념 설명 시 관련된 모든 하위 분류, 세부 사항도 함께 설명하세요.**
-
-**문제 유형인 경우 (객관식 문제):**
-```json
-{
-  "id": "문제 고유 ID",
-  "chapter_info": {
-    "chapter_number": "강의 번호",
-    "chapter_title": "강의 제목"
-  },
-  "problem_type": "문제 유형",
-  "context": "문제의 제시문 (표, 글 등)",
-  "question": "문제의 발문",
-  "stimulus_box": {
-    "ㄱ": "보기 ㄱ의 내용",
-    "ㄴ": "보기 ㄴ의 내용",
-    "ㄷ": "보기 ㄷ의 내용",
-    "ㄹ": "보기 ㄹ의 내용"
-  },
-  "options": {
-    "①": "선택지 1번 내용",
-    "②": "선택지 2번 내용",
-    "③": "선택지 3번 내용",
-    "④": "선택지 4번 내용",
-    "⑤": "선택지 5번 내용"
-  },
-  "answer": {
-    "correct_option": "③",
-    "explanation": "답안지 해설: 제조업체에서 제품의 품질을 일정하게 유지하고 호환성을 보장하기 위해 표준화가 필요하다. 추론 과정: 문제에서 제품 표준화의 의의를 묻고 있으며, 선택지 중 ③번이 표준화의 핵심 목적인 품질 일관성과 호환성을 가장 정확히 설명하고 있다.",
-    "answer_available": true
-  }
-}
-```
-
-**답안지가 없는 경우 예시:**
-```json
-{
-  "id": "문제 고유 ID",
-  "chapter_info": {
-    "chapter_number": "강의 번호",
-    "chapter_title": "강의 제목"
-  },
-  "problem_type": "문제 유형",
-  "context": "문제의 제시문 (표, 글 등)",
-  "question": "문제의 발문",
-  "options": {
-    "①": "선택지 1번 내용",
-    "②": "선택지 2번 내용",
-    "③": "선택지 3번 내용",
-    "④": "선택지 4번 내용",
-    "⑤": "선택지 5번 내용"
-  },
-  "answer": {
-    "correct_option": "unknown",
-    "explanation": "정답이 제공되지 않음",
-    "answer_available": false
-  }
-}
-```
-
-**정답 처리 가이드라인:**
-
-**우선순위 1: 답안지에서 정답 및 해설 확인**
-1. **답안지가 있고 해설도 포함된 경우**: 
-   - 답안지에서 해당 문항번호의 정답을 찾아 정확히 기입
-   - 답안지의 해설 내용을 바탕으로 추론 과정을 포함한 설명 작성
-   - `"correct_option": "③"` (답안지에 표시된 정확한 번호)
-   - `"explanation": "답안지 해설: [답안지의 원본 해설 내용]. 추론 과정: [문제 분석과 정답 도출 과정]"`
-   - `"answer_available": true`
-
-2. **답안지가 있지만 해설이 없는 경우**:
-   - 답안지에서 정답만 확인하고 문제 내용을 바탕으로 간단한 추론 제공
-   - `"correct_option": "③"` (답안지에 표시된 정확한 번호)
-   - `"explanation": "답안지 기준 정답: ③. 문제 분석: [문제 내용을 바탕으로 한 간단한 분석]"`
-   - `"answer_available": true`
-
-3. **답안지는 있지만 해당 문항이 없는 경우**:
-   - `"correct_option": "unknown"`
-   - `"explanation": "답안지에 해당 문항번호가 없음"`
-   - `"answer_available": false`
-
-**우선순위 2: 문제 페이지에서 정답 확인**
-4. **문제 페이지에 정답이 명시된 경우**: 
-   - 문제 페이지의 정답을 그대로 사용하고 문제 분석 추가
-   - `"explanation": "문제 내 정답: [정답]. 분석: [문제 해결 과정 설명]"`
-   - `"answer_available": true`
-
-**우선순위 3: 정답을 찾을 수 없는 경우**
-5. **답안지도 없고 문제에도 정답이 없는 경우**: 
-   - `"correct_option": "unknown"`
-   - `"explanation": "정답이 제공되지 않음"`
-   - `"answer_available": false`
-
-**⚠️ 중요: 해설 작성 지침**
-- 답안지에 해설이 있는 경우: 해설 내용을 바탕으로 추론 과정을 상세히 설명하세요
-- 답안지에 정답만 있는 경우: 문제 내용을 분석하여 정답 도출 과정을 간단히 설명하세요
-- 정답이 없는 경우에만 임의 추론을 금지하며, "unknown"으로 처리하세요
-- 반드시 답안지나 문제의 정답을 우선 확인한 후 해설을 작성하세요
-
-**개념 설명 유형인 경우 (하나의 개념당 여러 instruction 생성):**
-이미지에서 하나의 개념을 발견했을 때, 해당 개념의 내용 특성에 따라 여러 개의 JSON 객체를 생성하세요:
-
-```json
-[
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "[개념명]이란 무엇인가요?"},
-      {"role": "assistant", "content": "정의와 기본 개념 설명"}
-    ]
-  },
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "[개념명]의 분류 체계는 어떻게 구성되어 있나요?"},
-      {"role": "assistant", "content": "분류표의 모든 세부 항목과 코드 포함"}
-    ]
-  },
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "[개념명]의 구체적인 예시를 들어주세요."},
-      {"role": "assistant", "content": "실제 사례와 예시들"}
-    ]
-  }
-]
-```
-
-**내용 특성별 질문 생성 가이드:**
-
-📋 **정의/개념이 있는 경우:**
-- "[개념명]이란 무엇인가요?"
-- "[개념명]의 의미와 특징을 설명해주세요."
-
-📊 **분류표/체계가 있는 경우:**
-- "[개념명]의 분류 체계는 어떻게 구성되어 있나요?"
-- "[개념명]의 각 분류별 특징을 설명해주세요."
-- "KSIC 대분류 A~U는 각각 무엇을 의미하나요?"
-
-📈 **도표/그래프가 있는 경우:**
-- "[주제]의 변화 추이는 어떻게 나타나나요?"
-- "그래프에서 보여주는 [주제]의 특징은 무엇인가요?"
-
-🔍 **예시/사례가 있는 경우:**
-- "[개념명]의 구체적인 예시를 들어주세요."
-- "[개념명]이 실제 산업에서 어떻게 적용되나요?"
-
-⚖️ **비교표/장단점이 있는 경우:**
-- "A와 B의 차이점은 무엇인가요?"
-- "[개념명]의 장점과 단점은 무엇인가요?"
-
-🔄 **과정/단계가 있는 경우:**
-- "[과정명]의 단계별 절차를 설명해주세요."
-- "[개념명]은 어떤 과정을 거쳐 발전했나요?"
-
-🎯 **활용/목적이 있는 경우:**
-- "[개념명]의 활용 목적은 무엇인가요?"
-- "[개념명]이 왜 중요한가요?"
-
-**좋은 개념 설명 예시 (KSIC에서 여러 instruction 생성):**
-```json
-[
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "한국표준산업분류(KSIC)란 무엇인가요?"},
-      {"role": "assistant", "content": "한국표준산업분류(KSIC)는 국내 모든 산업 활동을 생산 단위의 유사성에 따라 체계적으로 분류한 국가 표준입니다. 통계청에서 관리하며, 공공 행정, 통계 작성, 산업 정책 수립 등에 활용됩니다."}
-    ]
-  },
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "KSIC의 분류 체계는 어떻게 구성되어 있나요?"},
-      {"role": "assistant", "content": "KSIC는 5단계로 구성됩니다:\n1. 대분류: A~U (21개 분류)\n2. 중분류: 2자리 숫자 (77개 분류)\n3. 소분류: 3자리 숫자 (232개 분류)\n4. 세분류: 4자리 숫자 (495개 분류)\n5. 세세분류: 5자리 숫자 (1,196개 분류)"}
-    ]
-  },
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "KSIC 대분류 A~U는 각각 무엇을 의미하나요?"},
-      {"role": "assistant", "content": "KSIC 대분류는 다음과 같습니다:\n- A: 농업, 임업 및 어업\n- B: 광업\n- C: 제조업\n- D: 전기, 가스, 증기 및 공기조절 공급업\n- E: 수도, 하수 및 폐기물 처리, 원료재생업\n- F: 건설업\n- G: 도매 및 소매업\n- H: 운수 및 창고업\n- I: 숙박 및 음식점업\n- J: 정보통신업\n- K: 금융 및 보험업\n- L: 부동산업\n- M: 전문, 과학 및 기술 서비스업\n- N: 사업시설 관리, 사업 지원 및 임대 서비스업\n- O: 공공 행정, 국방 및 사회보장 행정\n- P: 교육 서비스업\n- Q: 보건업 및 사회복지 서비스업\n- R: 예술, 스포츠 및 여가관련 서비스업\n- S: 협회 및 단체, 수리 및 기타 개인 서비스업\n- T: 가구 내 고용활동 및 달리 분류되지 않은 자가소비 생산활동\n- U: 국제 및 외국기관"}
-    ]
-  },
-  {
-    "messages": [
-      {"role": "system", "content": "당신은 산업기술 전문가입니다."},
-      {"role": "user", "content": "KSIC의 활용 목적은 무엇인가요?"},
-      {"role": "assistant", "content": "KSIC는 다음과 같은 목적으로 활용됩니다:\n1. 국민계정 작성 및 경제분석\n2. 산업구조 분석 및 정책 수립\n3. 통계 조사의 표준화\n4. 국제 비교 통계 작성\n5. 행정업무의 효율성 제고\n6. 민간 기업의 시장 분석 및 전략 수립 지원"}
-    ]
-  }
-]
-```
-
-**세부 추출 지침:**
-1. 각 문제/개념은 별도의 JSON 객체로 분리
-2. **하나의 개념에서 여러 측면의 질문을 생성** (정의→분류→예시→활용 등)
-3. 여러 개의 JSON 객체가 있다면 JSON 배열로 반환
-4. 이미지에서 식별되는 강의 번호와 제목을 정확히 추출
-5. 답안과 해설을 정확히 매칭
-6. 개념 설명의 경우 내용 특성을 파악하여 적절한 질문들을 생성
-
-**개념별 추출 전략:**
-- 하나의 개념 발견 시 → 해당 개념의 모든 측면을 다각도로 질문
-- 정의만 있어도 → 최소 2-3개의 질문 (정의, 특징, 중요성)
-- 분류표가 있으면 → 추가로 분류 체계 관련 질문
-- 예시가 있으면 → 추가로 실제 적용 사례 질문
-
-**특별히 놓치지 말아야 할 정보:**
-- 분류표의 모든 항목 (예: KSIC A~U 대분류, 중분류 번호 등)
-- 도표, 그래프의 수치와 라벨 (축 제목, 범례, 구체적 값)
-- 단계별 프로세스나 절차 (화살표로 연결된 과정들)
-- 공식, 계산법, 비율
-- 구체적인 예시나 사례 (회사명, 제품명 등)
-- 연도, 시대 구분, 시기별 특징
-- 용어의 정의와 특징, 구성 요소
-- 장단점, 문제점, 한계
-- 관련 법규나 기준, 정책
-- 비교표의 모든 항목과 차이점
-- 발전 단계나 변화 과정
-
-**실제 질문 생성 예시:**
-"콜린 클라크의 산업 분류" 개념이 있다면:
-- "콜린 클라크의 산업 분류란 무엇인가요?"
-- "클라크는 산업을 어떻게 1차, 2차, 3차로 구분했나요?"
-- "클라크 분류법의 각 산업별 특징은 무엇인가요?"
-- "클라크 분류법이 경제 분석에서 중요한 이유는 무엇인가요?"
-
-현재 분석할 이미지들의 내용을 위 지침에 따라 JSON으로 추출해주세요:
-"""
-        return base_prompt
-    
-    def load_images_from_directory(self, directory_path):
-        """디렉토리에서 모든 PNG 이미지 로드"""
-        png_files = sorted(list(directory_path.glob("*.png")))
-        images = []
+    def upload_pdf_file(self, file_path):
+        """PDF 파일을 Gemini에 업로드"""
+        file_path_str = str(file_path)
         
-        for png_file in png_files:
+        # 이미 업로드된 파일인지 확인
+        if file_path_str in self.uploaded_files:
+            file_uri = self.uploaded_files[file_path_str]
             try:
-                image = Image.open(png_file)
-                images.append((png_file.name, image))
-            except Exception as e:
-                logger.error(f"❌ 이미지 로드 실패 {png_file}: {str(e)}")
+                # 파일이 여전히 유효한지 확인
+                file = genai.get_file(file_uri.split('/')[-1])
+                if file.state.name == "ACTIVE":
+                    print(f"기존 업로드된 파일 사용: {file_path.name}")
+                    return file
+            except:
+                # 파일이 더 이상 유효하지 않음
+                del self.uploaded_files[file_path_str]
         
-        logger.info(f"  📸 로드된 이미지: {len(images)}개")
-        return images
+        # 새로운 파일 업로드
+        print(f"파일 업로드 중: {file_path.name}")
+        file = genai.upload_file(file_path)
+        
+        # 업로드 완료까지 대기
+        while file.state.name == "PROCESSING":
+            print("업로드 처리 중...")
+            time.sleep(2)
+            file = genai.get_file(file.name)
+        
+        if file.state.name == "FAILED":
+            raise ValueError(f"파일 업로드 실패: {file_path}")
+        
+        # 업로드된 파일 정보 저장
+        self.uploaded_files[file_path_str] = file.uri
+        self.save_uploaded_files()
+        
+        print(f"파일 업로드 완료: {file_path.name}")
+        return file
     
-    def process_directory(self, directory_name, images):
-        """디렉토리의 모든 이미지를 한 번에 처리"""
-        directory_type = "chapter" if "Chapter" in directory_name else "exam"
+    def upload_answer_sheet_once(self):
+        """답지 PDF를 한 번만 업로드 (모든 챕터에서 재사용)"""
+        if self.answer_sheet_file is not None:
+            return  # 이미 업로드됨
         
-        # EXAM 이미지들의 경우 참조 이미지를 사용하지 않음
-        use_reference = self.reference_image and directory_type != "exam"
-        reference_info = " + 참조이미지" if use_reference else ""
-        logger.info(f"    🔄 처리 중 ({len(images)}개 이미지{reference_info})")
+        # 첫 번째 챕터에서 답지 PDF 찾기
+        for chapter_num in range(1, 21):
+            chapter_dir = self.base_path / f"Industrial_Tech_College_Prep_Workbook_chapter_{chapter_num}_pdf"
+            if chapter_dir.exists():
+                pdf_files = list(chapter_dir.glob("*.pdf"))
+                for pdf_file in pdf_files:
+                    # 답지 파일인지 확인 (파일명에 특정 키워드가 있다고 가정)
+                    if any(keyword in pdf_file.name.lower() for keyword in ["answer", "답", "해설", "solution"]):
+                        print(f"\n답지 PDF 발견: {pdf_file.name}")
+                        self.answer_sheet_file = self.upload_pdf_file(pdf_file)
+                        return
         
-        try:
-            # 프롬프트와 이미지들 준비
-            prompt = self.get_prompt_template(directory_type)
-            content = [prompt]
-            
-            # 참조 이미지 먼저 추가 (Chapter 타입인 경우에만)
-            if use_reference:
-                content.append(self.reference_image)
-            
-            # 디렉토리의 모든 이미지들 추가
-            for img_name, img in images:
-                content.append(img)
-            
-            # Gemini API 호출
-            response = self.model.generate_content(content)
-            response_text = response.text.strip()
-            
-            # 디버깅용 응답 출력
-            logger.info(f"[DEBUG]: Gemini 응답 내용 (처음 500자)")
-            logger.info(f"[DEBUG]: {response_text[:500]}...")
-            if len(response_text) > 500:
-                logger.info(f"[DEBUG]: 전체 길이: {len(response_text)} 문자")
-            
-            # 결과 저장
-            result = {
-                "directory": directory_name,
-                "reference_image": "page_001.png" if use_reference else None,
-                "image_files": [img_name for img_name, _ in images],
-                "response": response_text,
-                "processed_at": datetime.now().isoformat()
-            }
-            
-            logger.info(f"    ✅ 처리 완료")
-            
-            # API 호출 제한 고려
-            time.sleep(3)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"    ❌ 처리 실패: {str(e)}")
-            return None
+        print("경고: 답지 PDF를 찾을 수 없습니다.")
     
-    def process_all_directories(self):
-        """모든 디렉토리 순서대로 처리"""
-        processing_order = self.get_processing_order()
-        all_results = []
-        
-        logger.info(f"\n{'='*70}")
-        logger.info(f"🚀 데이터셋 생성 작업 시작")
-        logger.info(f"{'='*70}")
-        
-        total_dirs = len(processing_order)
-        
-        for i, directory_name in enumerate(processing_order, 1):
-            directory_path = self.images_dir / directory_name
-            
-            logger.info(f"\n📂 [{i:2d}/{total_dirs}] {directory_name} 처리 중...")
-            logger.info(f"{'─'*50}")
-            
-            if not directory_path.exists():
-                logger.warning(f"⚠️  디렉토리가 존재하지 않음: {directory_name}")
-                continue
-            
-            # 디렉토리에서 이미지들 로드
-            images = self.load_images_from_directory(directory_path)
-            
-            if not images:
-                logger.warning(f"⚠️  이미지가 없음: {directory_name}")
-                continue
-            
-            # 디렉토리 처리 (모든 이미지 한 번에)
-            directory_result = self.process_directory(directory_name, images)
-            
-            if directory_result:
-                all_results.append(directory_result)
-                
-                # 디렉토리별 중간 저장
-                self.save_directory_results(directory_name, [directory_result])
-                
-                logger.info(f"✅ {directory_name} 완료")
-            else:
-                logger.error(f"❌ {directory_name} 처리 실패")
-        
-        # 최종 결과 저장
-        self.save_final_results(all_results)
-        
-        return all_results
-    
-    def clean_json_text(self, text):
-        """JSON 텍스트 정리 (간단하고 직접적인 방법)"""
+    def clean_json_response(self, response_text):
+        """Gemini 응답에서 JSON 코드 블록 마커를 제거하고 순수한 JSON만 추출"""
         import re
         
-        logger.info(f"[DEBUG]: JSON 텍스트 정리 시작 (원본 길이: {len(text)})")
-        
-        # 1. 제어 문자 제거 (탭, 개행 등은 유지)
-        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-        logger.info(f"[DEBUG]: 제어 문자 제거 완료")
-        
-        # 2. 잘못된 따옴표 수정
-        text = text.replace('"', '"').replace('"', '"')
-        text = text.replace("'", "'").replace("'", "'")
-        logger.info(f"[DEBUG]: 따옴표 정규화 완료")
-        
-        # 3. JSON 구문 오류 수정 (순차적이고 안전한 방법)
-        logger.info(f"[DEBUG]: 순차적 JSON 구문 오류 수정 시작")
-        
-        original_text = text
-        fixed_count = 0
-        
-        # 단계 1: 가장 기본적인 패턴 수정 (한 번에 하나씩)
-        basic_fixes = [
-            ('      "assistant",\n        "content":', '      "role": "assistant",\n        "content":'),
-            ('      "user",\n        "content":', '      "role": "user",\n        "content":'),
-            ('      "system",\n        "content":', '      "role": "system",\n        "content":'),
-            ('    "assistant",\n    "content":', '    "role": "assistant",\n    "content":'),
-            ('    "user",\n    "content":', '    "role": "user",\n    "content":'),
-            ('    "system",\n    "content":', '    "role": "system",\n    "content":'),
+        # 코드 블록 마커 패턴들
+        patterns = [
+            r'```json\s*',  # ```json 시작
+            r'```\s*',      # ``` 시작/끝
+            r'````json\s*', # ````json 시작
+            r'````\s*'      # ```` 시작/끝
         ]
         
-        for old_pattern, new_pattern in basic_fixes:
-            if old_pattern in text:
-                text = text.replace(old_pattern, new_pattern)
-                fixed_count += 1
-                logger.info(f"[DEBUG]: 기본 수정 ({fixed_count}): {old_pattern[:20]}... → {new_pattern[:20]}...")
+        cleaned_text = response_text.strip()
         
-        # 단계 2: 중괄호 직후 패턴 수정
-        brace_fixes = [
-            ('{\n        "assistant",', '{\n        "role": "assistant",'),
-            ('{\n        "user",', '{\n        "role": "user",'),
-            ('{\n        "system",', '{\n        "role": "system",'),
-            ('{\n      "assistant",', '{\n      "role": "assistant",'),
-            ('{\n      "user",', '{\n      "role": "user",'),
-            ('{\n      "system",', '{\n      "role": "system",'),
-        ]
+        # 모든 패턴 제거
+        for pattern in patterns:
+            cleaned_text = re.sub(pattern, '', cleaned_text)
         
-        for old_pattern, new_pattern in brace_fixes:
-            if old_pattern in text:
-                text = text.replace(old_pattern, new_pattern)
-                fixed_count += 1
-                logger.info(f"[DEBUG]: 중괄호 수정 ({fixed_count}): {old_pattern[:15]}... → {new_pattern[:15]}...")
+        # 앞뒤 공백 제거
+        cleaned_text = cleaned_text.strip()
         
-        # 단계 3: 남은 간단한 패턴들
-        remaining_fixes = [
-            ('"assistant",\n        "content":', '"role": "assistant",\n        "content":'),
-            ('"user",\n        "content":', '"role": "user",\n        "content":'),
-            ('"system",\n        "content":', '"role": "system",\n        "content":'),
-        ]
-        
-        for old_pattern, new_pattern in remaining_fixes:
-            if old_pattern in text and '"role":' not in text[max(0, text.find(old_pattern)-20):text.find(old_pattern)]:
-                text = text.replace(old_pattern, new_pattern)
-                fixed_count += 1
-                logger.info(f"[DEBUG]: 남은 패턴 수정 ({fixed_count}): {old_pattern[:20]}...")
-        
-        # 단계 4: 혹시 중복된 role 키가 생겼다면 정리
-        if '"role": "role":' in text:
-            text = text.replace('"role": "role":', '"role":')
-            logger.info(f"[DEBUG]: 중복 role 키 정리 완료")
-            fixed_count += 1
-        
-        if '"role": "role": "role":' in text:
-            text = text.replace('"role": "role": "role":', '"role":')
-            logger.info(f"[DEBUG]: 3중 중복 role 키 정리 완료")
-            fixed_count += 1
-        
-        if text != original_text:
-            logger.info(f"[DEBUG]: JSON 구문 오류 수정 완료 ({fixed_count}개 수정, 길이 {len(original_text)} → {len(text)})")
-        else:
-            logger.info(f"[DEBUG]: JSON 구문 오류 수정 불필요 (이미 올바른 형식)")
-        
-        # 4. 줄바꿈 문자 정규화
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        
-        # 5. 연속된 공백 정리
-        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
-        
-        logger.info(f"[DEBUG]: JSON 텍스트 정리 완료 (최종 길이: {len(text)})")
-        return text
+        return cleaned_text
     
-    def validate_and_fix_answer_fields(self, parsed_data):
-        """답안 필드 검증 및 보완 (답안지 처리 포함)"""
-        fixed_count = 0
-        logger.info(f"[DEBUG]: 답안 필드 검증 시작 - {len(parsed_data)}개 항목")
+    def check_existing_files(self, chapter_num):
+        """특정 챕터의 데이터셋이 이미 생성되었는지 확인"""
+        problem_file = self.response_path / f"chapter_{chapter_num}_problems.json"
+        concept_file = self.response_path / f"chapter_{chapter_num}_concepts.json"
         
-        for i, item in enumerate(parsed_data):
-            # 객관식 문제인 경우 답안 필드 검증
-            if isinstance(item, dict) and item.get("problem_type") and "객관식" in str(item.get("problem_type", "")):
-                logger.info(f"[DEBUG]: 항목 {i+1} - 객관식 문제 검증 중")
-                answer = item.get("answer", {})
-                
-                # answer 필드가 없거나 비어있는 경우
-                if not answer or answer is None:
-                    logger.info(f"[DEBUG]: 항목 {i+1} - answer 필드 누락, 기본값 설정")
-                    item["answer"] = {
-                        "correct_option": "unknown",
-                        "explanation": "정답이 제공되지 않음 (답안지 또는 문제에서 확인 필요)",
-                        "answer_available": False
-                    }
-                    fixed_count += 1
-                else:
-                    # correct_option이 None이거나 빈 값인 경우
-                    if not answer.get("correct_option") or answer.get("correct_option") in [None, "", "null", "NULL"]:
-                        logger.info(f"[DEBUG]: 항목 {i+1} - correct_option 수정: '{answer.get('correct_option')}' → 'unknown'")
-                        answer["correct_option"] = "unknown"
-                        if not answer.get("explanation"):
-                            answer["explanation"] = "정답이 제공되지 않음"
-                        fixed_count += 1
-                    
-                    # explanation이 None이거나 빈 값인 경우
-                    if not answer.get("explanation") or answer.get("explanation") in [None, "", "null", "NULL"]:
-                        # correct_option이 있는 경우 답안지에서 가져온 것으로 간주
-                        if answer.get("correct_option") and answer.get("correct_option") != "unknown":
-                            answer["explanation"] = f"답안지 기준 정답: {answer.get('correct_option')}. 추가 분석이 필요함"
-                        else:
-                            answer["explanation"] = "정답이 제공되지 않음"
-                        fixed_count += 1
-                    
-                    # answer_available 필드 추가/수정
-                    if "answer_available" not in answer:
-                        answer["answer_available"] = (
-                            answer.get("correct_option") not in [None, "", "unknown", "null", "NULL"] and
-                            answer.get("correct_option") is not None
-                        )
-                    
-                    # 답안지 기반 정답인지 확인하여 explanation 개선
-                    if (answer.get("correct_option") not in ["unknown", None, "", "null", "NULL"] and
-                        len(str(answer.get("explanation", "")).strip()) < 20):  # 매우 짧은 설명인 경우
-                        # 설명이 부족한 경우 답안지 해설 참조 요청 메시지 추가
-                        old_explanation = answer.get("explanation", "")
-                        answer["explanation"] = f"답안지 기준 정답: {answer.get('correct_option')}. {old_explanation} (답안지 해설 참조 필요)".strip()
+        both_exist = problem_file.exists() and concept_file.exists()
         
-        if fixed_count > 0:
-            logger.info(f"[DEBUG]: 🔧 답안 필드 보완 완료: {fixed_count}개 항목 수정됨")
-        else:
-            logger.info(f"[DEBUG]: ✅ 모든 답안 필드가 정상 상태")
+        if both_exist:
+            print(f"챕터 {chapter_num}의 데이터셋이 이미 존재합니다. 건너뜁니다.")
+            return True
+        elif problem_file.exists():
+            print(f"챕터 {chapter_num}의 문제풀이 데이터셋만 존재합니다. 개념설명만 생성합니다.")
+        elif concept_file.exists():
+            print(f"챕터 {chapter_num}의 개념설명 데이터셋만 존재합니다. 문제풀이만 생성합니다.")
         
-        return parsed_data
+        return False
     
-    def parse_gemini_response(self, response_text):
-        """Gemini 응답에서 JSON 데이터 추출 및 파싱 (개선된 버전)"""
-        original_text = response_text
-        
-        try:
-            logger.info(f"[DEBUG]: JSON 파싱 시작")
-            
-            # 1단계: 마크다운 코드 블록 제거
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-                logger.info(f"[DEBUG]: ```json 블록에서 JSON 추출")
-            elif "```" in response_text:
-                # 첫 번째 ``` 이후, 마지막 ``` 이전 내용 추출
-                parts = response_text.split("```")
-                if len(parts) >= 3:
-                    response_text = parts[1].strip()
-                    logger.info(f"[DEBUG]: ``` 블록에서 JSON 추출 ({len(parts)}개 부분)")
-                else:
-                    response_text = response_text.replace("```", "").strip()
-                    logger.info(f"[DEBUG]: ``` 기호 제거")
-            else:
-                logger.info(f"[DEBUG]: 코드 블록 없음, 원본 텍스트 사용")
-            
-            # 2단계: JSON 텍스트 정리
-            cleaned_response = self.clean_json_text(response_text)
-            logger.info(f"[DEBUG]: 텍스트 정리 완료 (길이: {len(cleaned_response)})")
-            
-            # 3단계: JSON 파싱 시도
-            logger.info(f"[DEBUG]: JSON 파싱 시도 중...")
-            parsed_data = json.loads(cleaned_response)
-            
-            # 4단계: 리스트가 아니면 리스트로 변환
-            if not isinstance(parsed_data, list):
-                parsed_data = [parsed_data]
-                
-            # 5단계: 답안 필드 검증 및 보완
-            parsed_data = self.validate_and_fix_answer_fields(parsed_data)
-            
-            logger.info(f"[DEBUG]: ✅ JSON 파싱 성공: {len(parsed_data)}개 항목")
-            return parsed_data
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"[DEBUG]: ❌ JSON 파싱 실패: {str(e)}")
-            logger.error(f"[DEBUG]: 실패 위치: line {e.lineno}, column {e.colno}")
-            logger.error(f"[DEBUG]: 처리된 텍스트 일부: {cleaned_response[:300]}...")
-            
-            # 실패한 부분 주변 텍스트 출력
-            try:
-                lines = cleaned_response.split('\n')
-                if e.lineno <= len(lines):
-                    logger.error(f"[DEBUG]: 문제 라인 {e.lineno}: {lines[e.lineno-1] if e.lineno > 0 else 'N/A'}")
-            except:
-                pass
-            
-            # JSON 파싱 실패 시에도 원본 텍스트 반환 (파싱 시도를 위해)
-            logger.info(f"[DEBUG]: 부분 파싱 시도 중...")
-            partial_data = self.try_partial_json_parsing(cleaned_response, original_text)
-            if partial_data:
-                return self.validate_and_fix_answer_fields(partial_data)
-            return partial_data
-            
-        except Exception as e:
-            logger.error(f"[DEBUG]: ❌ 예상치 못한 파싱 오류: {str(e)}")
-            logger.error(f"[DEBUG]: 원본 응답 일부: {original_text[:300]}...")
-            return []
-    
-    def try_partial_json_parsing(self, cleaned_text, original_text):
-        """부분적 JSON 파싱 시도 (강화된 버전)"""
-        try:
-            logger.info(f"[DEBUG]: 부분 파싱 전략 1 - 배열 래핑 시도")
-            # 1. 배열로 감싸서 시도
-            if not cleaned_text.strip().startswith('['):
-                wrapped_text = f"[{cleaned_text}]"
-                try:
-                    parsed_data = json.loads(wrapped_text)
-                    logger.warning(f"[DEBUG]: ✅ 배열 래핑으로 파싱 성공: {len(parsed_data)}개 항목")
-                    return parsed_data
-                except Exception as wrap_error:
-                    logger.info(f"[DEBUG]: 배열 래핑 실패: {str(wrap_error)}")
-                    pass
-            
-            # 2. 여러 개의 완전한 JSON 객체 추출 시도 (모든 객체 추출)
-            logger.info(f"[DEBUG]: 부분 파싱 전략 2 - 모든 완전한 객체 추출 시도")
-            objects = []
-            brace_count = 0
-            start_pos = None
-            i = 0
-            
-            while i < len(cleaned_text):
-                char = cleaned_text[i]
-                if char == '{':
-                    if brace_count == 0:  # 새로운 객체 시작
-                        start_pos = i
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_pos is not None:
-                        # 완전한 객체 발견
-                        single_object = cleaned_text[start_pos:i+1]
-                        logger.info(f"[DEBUG]: 객체 발견 (위치: {start_pos}-{i}, 길이: {len(single_object)})")
-                        try:
-                            parsed_obj = json.loads(single_object)
-                            objects.append(parsed_obj)
-                            logger.info(f"[DEBUG]: ✅ 객체 파싱 성공 ({len(objects)}번째)")
-                        except Exception as obj_error:
-                            logger.error(f"[DEBUG]: 객체 파싱 실패 ({len(objects)+1}번째): {str(obj_error)}")
-                        start_pos = None
-                i += 1
-            
-            if objects:
-                logger.warning(f"[DEBUG]: ✅ 부분 파싱 성공: {len(objects)}개 항목 추출")
-                return objects
-            
-            # 3. 첫 번째 완전한 JSON 객체만 추출 (기존 방식)
-            logger.info(f"[DEBUG]: 부분 파싱 전략 3 - 첫 번째 완전한 객체만 추출 시도")
-            brace_count = 0
-            start_pos = cleaned_text.find('{')
-            if start_pos != -1:
-                logger.info(f"[DEBUG]: 첫 번째 '{{' 위치: {start_pos}")
-                for i, char in enumerate(cleaned_text[start_pos:], start_pos):
-                    if char == '{':
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            # 완전한 객체 발견
-                            single_object = cleaned_text[start_pos:i+1]
-                            logger.info(f"[DEBUG]: 완전한 객체 발견 (길이: {len(single_object)})")
-                            try:
-                                parsed_data = json.loads(single_object)
-                                logger.warning(f"[DEBUG]: ✅ 부분 파싱 성공: 1개 항목 추출")
-                                return [parsed_data]
-                            except Exception as obj_error:
-                                logger.error(f"[DEBUG]: 객체 파싱 실패: {str(obj_error)}")
-                                break
-            else:
-                logger.info(f"[DEBUG]: '{{' 기호를 찾을 수 없음")
-            
-            # 4. 라인별 객체 추출 시도
-            logger.info(f"[DEBUG]: 부분 파싱 전략 4 - 라인별 객체 추출 시도")
-            lines = cleaned_text.split('\n')
-            objects = []
-            current_object = ""
-            brace_count = 0
-            
-            for line_num, line in enumerate(lines):
-                current_object += line + '\n'
-                for char in line:
-                    if char == '{':
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                
-                if brace_count == 0 and current_object.strip():
-                    # 완전한 객체가 될 수 있음
-                    obj_text = current_object.strip()
-                    if obj_text.startswith('{') and obj_text.endswith('}'):
-                        try:
-                            parsed_obj = json.loads(obj_text)
-                            objects.append(parsed_obj)
-                            logger.info(f"[DEBUG]: ✅ 라인별 객체 파싱 성공 ({len(objects)}번째, 라인 {line_num})")
-                        except:
-                            pass
-                    current_object = ""
-            
-            if objects:
-                logger.warning(f"[DEBUG]: ✅ 라인별 파싱 성공: {len(objects)}개 항목 추출")
-                return objects
-            
-            logger.error(f"[DEBUG]: ❌ 모든 파싱 시도 실패")
-            return []
-            
-        except Exception as e:
-            logger.error(f"[DEBUG]: ❌ 부분 파싱 중 오류: {str(e)}")
-            return []
-    
-    def save_directory_results(self, directory_name, results):
-        """디렉토리별 결과 저장 (깔끔한 JSON 형식 + 원본 응답 백업)"""
-        if not results:
+    def get_problem_solving_prompt(self, chapter_num):
+        """문제풀이 데이터셋 생성을 위한 프롬프트"""
+        return f"""
+업로드된 PDF 파일들을 분석하여 다음 작업을 수행해주세요:
+
+**목표**: 챕터 {chapter_num}의 수능실전 문제들을 JSON 형식으로 추출
+
+**절대 중요**: PDF에서 찾을 수 있는 모든 수능실전 문제를 빠짐없이 추출해야 합니다. 보통 10문제 정도가 있으니 모든 문제가 포함되었는지 확인해주세요.
+
+**보기(stimulus_box) 처리 절대 필수사항**:
+⚠️ 이 부분이 가장 중요합니다 ⚠️
+
+1. 문제에서 "다음 중 옳은 것만을 <보기>에서 있는 대로 고른 것은?" 같은 표현이 있으면
+2. 반드시 PDF에서 해당 문제의 <보기> 섹션을 찾아서
+3. ㄱ, ㄴ, ㄷ, ㄹ, ㅁ 등의 각 보기 내용을 stimulus_box에 포함해야 합니다
+
+**보기 추출 예시**:
+- PDF에서 이런 보기가 있다면:
+  <보기>
+  ㄱ. 중세 산업 사회에서는 길드가 운영되었다.
+  ㄴ. 근대 산업 사회에서 공장제 기계공업이 발달했다.
+  ㄷ. 현대 산업 사회에서는 산업구조가 고도화되었다.
+  ㄹ. 신발공업은 경공업에 해당한다.
+
+- JSON에서는 이렇게 표현해야 합니다:
+  "stimulus_box": {{
+    "ㄱ": "중세 산업 사회에서는 길드가 운영되었다.",
+    "ㄴ": "근대 산업 사회에서 공장제 기계공업이 발달했다.",
+    "ㄷ": "현대 산업 사회에서는 산업구조가 고도화되었다.",
+    "ㄹ": "신발공업은 경공업에 해당한다."
+  }}
+
+**작업 지침**:
+1. PDF에서 "수능실전" 또는 문제 풀이 섹션을 모두 찾아주세요
+2. 각 문제마다 <보기>가 있는지 꼼꼼히 확인하세요
+3. <보기>가 있으면 반드시 ㄱ, ㄴ, ㄷ, ㄹ 내용을 추출하세요
+4. 찾은 모든 문제를 다음 JSON 형식으로 변환해주세요
+
+```json
+{{
+  "id": "문제 번호 [1~10]",
+  "chapter_info": {{
+    "chapter_number": "{chapter_num}",
+    "chapter_title": "챕터 제목을 PDF에서 추출"
+  }},
+  "question": "문제의 발문",
+  "context": "문제의 제시문 (표, 글 등)",
+  "stimulus_box": {{
+    "ㄱ": "보기 ㄱ의 실제 내용을 여기에",
+    "ㄴ": "보기 ㄴ의 실제 내용을 여기에",
+    "ㄷ": "보기 ㄷ의 실제 내용을 여기에",
+    "ㄹ": "보기 ㄹ의 실제 내용을 여기에"
+  }},
+  "options": {{
+    "①": "선택지 1번 내용",
+    "②": "선택지 2번 내용", 
+    "③": "선택지 3번 내용",
+    "④": "선택지 4번 내용",
+    "⑤": "선택지 5번 내용"
+  }},
+  "answer": {{
+    "correct_option": "정답 번호",
+    "explanation": "상세 해설 (오답피하기 포함)"
+  }}
+}}
+```
+
+**반드시 확인해야 할 사항들**:
+✅ 문제에 "~을 <보기>에서 고른 것은?" 표현이 있으면 → stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용 필수 포함
+✅ 보기가 진짜 없는 문제만 → stimulus_box를 빈 객체 {{}} 로 설정
+✅ 선택지가 5개 미만인 경우 → 해당하는 선택지만 포함  
+✅ 해설에서 "오답피하기" 키워드가 있는 경우 → 반드시 포함
+✅ PDF에서 찾을 수 있는 모든 수능실전 문제 → 빠짐없이 포함 (보통 10문제)
+
+**최종 점검**:
+- 각 문제를 다시 한번 확인하여 <보기> 섹션이 있는데 stimulus_box가 비어있으면 안됩니다
+- <보기>에서 고른다는 표현이 있는 문제는 100% stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용이 있어야 합니다
+- 보기 내용을 찾지 못했다면 PDF를 다시 꼼꼼히 확인해주세요
+
+응답은 반드시 유효한 JSON 배열 형식으로만 해주세요. 보기 내용이 누락되었다면 절대 안됩니다!
+"""
+
+    def get_concept_explanation_prompt(self, chapter_num):
+        """개념설명 데이터셋 생성을 위한 프롬프트"""
+        return f"""
+업로드된 PDF 파일들을 분석하여 다음 작업을 수행해주세요:
+
+**목표**: 챕터 {chapter_num}의 모든 개념과 용어를 Chat 형식 데이터셋으로 변환
+
+**절대 필수 요구사항**: 
+- 반드시 정확히 300개 이상의 질문-답변 쌍을 생성해야 합니다
+- 300개 미만이면 절대 안됩니다
+- 개수가 부족하면 더 세분화하여 300개를 채워주세요
+
+**작업 지침**:
+1. PDF에서 개념 설명, 용어 정의, 이론 부분을 모두 찾아주세요
+2. 다음 전략을 사용하여 반드시 300개 이상의 질문-답변 쌍을 만들어주세요:
+
+**세분화 전략 (300개 달성을 위해 적극 활용)**:
+- **모든 용어 정의**: 본문과 보조단에 설명된 모든 용어에 대해 각각의 정의를 묻는 질문
+- **목록 분할**: 하나의 목록에 포함된 모든 항목을 각각 별개의 질문으로 분리
+- **세부 특성**: 각 개념의 특성, 장단점, 적용 분야를 개별 질문으로 분리
+- **비교 질문**: 유사한 개념들 간의 차이점과 공통점을 여러 관점에서 질문
+- **실제 적용**: 각 개념이 실제 어떻게 사용되는지에 대한 질문
+- **원리 설명**: 작동 원리, 구조, 메커니즘에 대한 세부 질문
+- **분류 체계**: 분류 기준, 종류, 유형에 대한 질문
+- **역사적 발전**: 각 개념의 발전 과정, 변화
+- **예시와 사례**: 구체적인 예시들을 각각 별개 질문으로
+- **상황별 적용**: 다양한 상황에서의 적용 방법
+
+3. 각 질문-답변 쌍은 다음 JSON 형식으로 작성:
+
+```json
+{{
+  "messages": [
+    {{"role": "system", "content": "당신은 대한민국 수능 직업탐구 영역 '공업 일반' 과목에 정통한 전문가입니다."}},
+    {{"role": "user", "content": "구체적인 질문"}},
+    {{"role": "assistant", "content": "상세하고 정확한 답변"}}
+  ]
+}}
+```
+
+**질문 유형 예시 (300개 달성을 위해 다양하게)**:
+- "○○○의 정의는 무엇입니까?"
+- "○○○의 특징을 설명해주세요"
+- "○○○와 △△△의 차이점은 무엇입니까?"
+- "○○○이 사용되는 분야는 어디입니까?"
+- "○○○의 작동 원리를 설명해주세요"
+- "○○○의 장점과 단점은 무엇입니까?"
+- "○○○의 종류에는 무엇이 있나요?"
+- "○○○는 언제 사용됩니까?"
+- "○○○의 구조는 어떻게 되어 있나요?"
+- "○○○가 발전한 과정을 설명해주세요"
+- "○○○ 권리의 유효 기간은 얼마입니까?"
+
+**절대 필수 확인사항**:
+- 반드시 300개 이상의 질문-답변 쌍을 생성해야 합니다
+- 모든 답변은 교사 톤으로 상세하고 정확하게 작성
+- 중복되는 내용이라도 다른 관점에서 질문을 만들어 개수를 확보
+- 모든 전문 용어와 개념을 빠짐없이 포함
+- 300개 미만이면 더 세분화하여 개수를 채우세요
+
+**개수 확인**: 응답 전에 생성한 질문-답변 쌍의 개수를 세어보고, 300개 미만이면 더 추가해주세요.
+
+응답은 반드시 유효한 JSON 배열 형식으로만 해주세요. 300개 이상이 되었는지 꼭 확인하세요.
+"""
+
+    def get_kice_exam_prompt(self, exam_name):
+        """KICE 시험 데이터셋 생성을 위한 프롬프트"""
+        return f"""
+업로드된 PDF 파일들을 분석하여 다음 작업을 수행해주세요:
+
+**목표**: {exam_name} 시험의 공업일반 과목 문제들을 JSON 형식으로 추출
+
+**절대 중요**: PDF에서 찾을 수 있는 모든 공업일반 문제를 빠짐없이 추출해야 합니다.
+
+**보기(stimulus_box) 처리 절대 필수사항**:
+⚠️ 이 부분이 가장 중요합니다 ⚠️
+
+1. 문제에서 "다음 중 옳은 것만을 <보기>에서 있는 대로 고른 것은?" 같은 표현이 있으면
+2. 반드시 PDF에서 해당 문제의 <보기> 섹션을 찾아서
+3. ㄱ, ㄴ, ㄷ, ㄹ, ㅁ 등의 각 보기 내용을 stimulus_box에 포함해야 합니다
+
+**보기 추출 예시**:
+- PDF에서 이런 보기가 있다면:
+  <보기>
+  ㄱ. 중세 산업 사회에서는 길드가 운영되었다.
+  ㄴ. 근대 산업 사회에서 공장제 기계공업이 발달했다.
+  ㄷ. 현대 산업 사회에서는 산업구조가 고도화되었다.
+  ㄹ. 신발공업은 경공업에 해당한다.
+
+- JSON에서는 이렇게 표현해야 합니다:
+  "stimulus_box": {{
+    "ㄱ": "중세 산업 사회에서는 길드가 운영되었다.",
+    "ㄴ": "근대 산업 사회에서 공장제 기계공업이 발달했다.",
+    "ㄷ": "현대 산업 사회에서는 산업구조가 고도화되었다.",
+    "ㄹ": "신발공업은 경공업에 해당한다."
+  }}
+
+**작업 지침**:
+1. PDF에서 공업일반 과목의 모든 문제를 찾아주세요
+2. 각 문제마다 <보기>가 있는지 꼼꼼히 확인하세요
+3. <보기>가 있으면 반드시 ㄱ, ㄴ, ㄷ, ㄹ 내용을 추출하세요
+4. 시험 정보를 정확히 파악하여 EXAM_NAME에 포함하세요
+5. 찾은 모든 문제를 다음 JSON 형식으로 변환해주세요
+
+```json
+{{
+  "id": "문제 번호",
+  "EXAM_NAME": "시험 이름",
+  "question": "문제의 발문",
+  "context": "문제의 제시문 (표, 글 등)",
+  "stimulus_box": {{
+    "ㄱ": "보기 ㄱ의 실제 내용을 여기에",
+    "ㄴ": "보기 ㄴ의 실제 내용을 여기에",
+    "ㄷ": "보기 ㄷ의 실제 내용을 여기에",
+    "ㄹ": "보기 ㄹ의 실제 내용을 여기에"
+  }},
+  "options": {{
+    "①": "선택지 1번 내용",
+    "②": "선택지 2번 내용", 
+    "③": "선택지 3번 내용",
+    "④": "선택지 4번 내용",
+    "⑤": "선택지 5번 내용"
+  }},
+  "answer": {{
+    "correct_option": "정답 번호",
+    "explanation": "상세 해설 (오답피하기 포함)"
+  }}
+}}
+```
+
+**반드시 확인해야 할 사항들**:
+✅ **explanation 필드에는 직접 Reasoning LLM이 추론하는 듯한 과정으로 보이는 LLM 추론과정을 포함하여 정답에 맞는 해설 과정을 작성해주세요. '해설:'뒤에 내용을 작성합니다.**"
+✅ 문제에 "~을 <보기>에서 고른 것은?" 표현이 있으면 → stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용 필수 포함
+✅ 보기가 진짜 없는 문제만 → stimulus_box를 빈 객체 {{}} 로 설정
+✅ 선택지가 5개 미만인 경우 → 해당하는 선택지만 포함  
+✅ 해설에서 "오답피하기" 키워드가 있는 경우 → 반드시 포함
+✅ PDF에서 찾을 수 있는 모든 공업일반 문제 → 빠짐없이 포함
+✅ 시험 정보를 정확히 파악하여 EXAM_NAME에 포함 (예: "2017학년도대학수학능력시험6월모의평가")
+
+**최종 점검**:
+- 각 문제를 다시 한번 확인하여 <보기> 섹션이 있는데 stimulus_box가 비어있으면 안됩니다
+- <보기>에서 고른다는 표현이 있는 문제는 100% stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용이 있어야 합니다
+
+응답은 반드시 유효한 JSON 배열 형식으로만 해주세요.
+"""
+
+    def process_chapter(self, chapter_num):
+        """특정 챕터의 PDF들을 처리"""
+        # 이미 생성된 파일이 있는지 확인
+        if self.check_existing_files(chapter_num):
             return
         
-        # 디렉토리 결과에서 JSON 데이터 추출
-        clean_data = []
-        raw_responses = []
+        chapter_dir = self.base_path / f"Industrial_Tech_College_Prep_Workbook_chapter_{chapter_num}_pdf"
         
-        for result in results:
-            response_text = result.get("response", "")
-            raw_responses.append({
-                "directory": directory_name,
-                "image_files": result.get("image_files", []),
-                "raw_response": response_text,
-                "processed_at": result.get("processed_at")
-            })
-            
-            parsed_items = self.parse_gemini_response(response_text)
-            clean_data.extend(parsed_items)
+        if not chapter_dir.exists():
+            print(f"챕터 {chapter_num} 디렉토리가 존재하지 않습니다: {chapter_dir}")
+            return
         
-        # 1. 파싱된 데이터 저장 (성공한 경우)
-        if clean_data:
-            output_file = self.output_dir / f"{directory_name}.json"
+        print(f"\n=== 챕터 {chapter_num} 처리 시작 ===")
+        
+        # 챕터 디렉토리 내의 PDF 파일들 찾기
+        pdf_files = list(chapter_dir.glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"챕터 {chapter_num}에서 PDF 파일을 찾을 수 없습니다.")
+            return
+        
+        print(f"발견된 PDF 파일들: {[f.name for f in pdf_files]}")
+        
+        # PDF 파일들 업로드 (답지 제외)
+        uploaded_files = []
+        for pdf_file in pdf_files:
             try:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(clean_data, f, ensure_ascii=False, indent=2)
-                logger.info(f"  💾 파싱 데이터 저장: {output_file.name} ({len(clean_data)}개 항목)")
+                # 답지가 아닌 파일만 업로드
+                if not any(keyword in pdf_file.name.lower() for keyword in ["answer", "답", "해설", "solution"]):
+                    uploaded_file = self.upload_pdf_file(pdf_file)
+                    uploaded_files.append(uploaded_file)
             except Exception as e:
-                logger.error(f"  ❌ 파싱 데이터 저장 실패 {directory_name}: {str(e)}")
+                print(f"파일 업로드 실패 {pdf_file.name}: {e}")
+                continue
         
-        # 2. 원본 응답 저장 (항상 저장)
-        raw_output_file = self.output_dir / f"{directory_name}_raw_response.json"
-        try:
-            with open(raw_output_file, 'w', encoding='utf-8') as f:
-                json.dump(raw_responses, f, ensure_ascii=False, indent=2)
-            logger.info(f"  💾 원본 응답 저장: {raw_output_file.name}")
-        except Exception as e:
-            logger.error(f"  ❌ 원본 응답 저장 실패 {directory_name}: {str(e)}")
+        # 답지 파일도 추가 (이미 업로드됨)
+        if self.answer_sheet_file:
+            uploaded_files.append(self.answer_sheet_file)
         
-        # 파싱된 데이터가 없는 경우에도 알림
-        if not clean_data:
-            logger.warning(f"  ⚠️  JSON 파싱 실패했지만 원본 응답은 저장됨: {directory_name}")
-            logger.info(f"  📝 원본 응답 확인: {raw_output_file.name}")
-    
-    def analyze_dataset_statistics(self, all_clean_data):
-        """데이터셋 통계 분석 (답안지 기반 답안 포함)"""
-        stats = {
-            "total_items": len(all_clean_data),
-            "problems": 0,
-            "concepts": 0,
-            "problems_with_answers": 0,
-            "problems_without_answers": 0,
-            "problems_with_answer_key": 0,  # 답안지에서 가져온 답안
-            "problems_with_inline_answer": 0,  # 문제에 직접 표시된 답안
-            "problems_with_detailed_explanation": 0,  # 상세한 해설이 있는 문제
-            "problems_with_basic_explanation": 0,  # 기본적인 해설만 있는 문제
-            "answer_availability_rate": 0.0
-        }
+        if not uploaded_files:
+            print(f"챕터 {chapter_num}에서 업로드된 파일이 없습니다.")
+            return
         
-        for item in all_clean_data:
-            if isinstance(item, dict):
-                # 문제 유형 분류
-                if item.get("problem_type") and "객관식" in str(item.get("problem_type", "")):
-                    stats["problems"] += 1
-                    
-                    # 답안 유무 확인
-                    answer = item.get("answer", {})
-                    if answer.get("answer_available") is True or (
-                        answer.get("correct_option") and 
-                        answer.get("correct_option") not in ["unknown", "null", "", None]
-                    ):
-                        stats["problems_with_answers"] += 1
-                        
-                        # 답안 출처 구분
-                        explanation = str(answer.get("explanation", ""))
-                        if "답안지" in explanation or "answer key" in explanation.lower():
-                            stats["problems_with_answer_key"] += 1
-                        else:
-                            stats["problems_with_inline_answer"] += 1
-                        
-                        # 해설의 질 평가
-                        if ("추론 과정" in explanation or "분석" in explanation or 
-                            "해설:" in explanation or len(explanation) > 50):
-                            stats["problems_with_detailed_explanation"] += 1
-                        else:
-                            stats["problems_with_basic_explanation"] += 1
-                    else:
-                        stats["problems_without_answers"] += 1
+        # 1. 문제풀이 데이터셋 생성 (이미 존재하지 않는 경우만)
+        problem_file = self.response_path / f"chapter_{chapter_num}_problems.json"
+        if not problem_file.exists():
+            print(f"\n--- 챕터 {chapter_num} 문제풀이 데이터셋 생성 중 ---")
+            try:
+                problem_prompt = self.get_problem_solving_prompt(chapter_num)
                 
-                elif item.get("messages"):  # 개념 설명 유형
-                    stats["concepts"] += 1
+                if self.debug:
+                    print("🔍 문제풀이 프롬프트 전송 중...")
+                    print("=" * 80)
+                    print("📝 문제풀이 프롬프트 내용:")
+                    print("-" * 80)
+                    print(problem_prompt[:1000] + "..." if len(problem_prompt) > 1000 else problem_prompt)
+                    print("=" * 80)
+                    print("📤 Gemini API 호출 시작...")
+                
+                problem_response = self.model.generate_content(
+                    [problem_prompt] + uploaded_files,
+                    stream=True if self.debug else False
+                )
+                
+                if self.debug:
+                    print("📥 Gemini 실시간 응답 스트리밍 시작...")
+                    print("=" * 80)
+                    print("🤖 실시간 Gemini 문제풀이 응답:")
+                    print("-" * 80)
+                    
+                    full_response = ""
+                    for chunk in problem_response:
+                        if chunk.text:
+                            print(chunk.text, end="", flush=True)
+                            full_response += chunk.text
+                    
+                    print("\n" + "=" * 80)
+                    print("📥 응답 스트리밍 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 전체 응답 길이: {len(full_response)} 문자")
+                    
+                    # 스트리밍 응답을 단일 응답 객체로 변환
+                    class ResponseWrapper:
+                        def __init__(self, text):
+                            self.text = text
+                    
+                    problem_response = ResponseWrapper(full_response)
+                else:
+                    print("📥 Gemini 응답 수신 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 원본 응답 길이: {len(problem_response.text)} 문자")
+                
+                # JSON 응답에서 코드 블록 마커 제거
+                cleaned_response = self.clean_json_response(problem_response.text)
+                
+                if self.debug:
+                    print(f"✂️ 정리된 응답 길이: {len(cleaned_response)} 문자")
+                    print("🔍 JSON 검증 중...")
+                
+                # 응답 검증
+                try:
+                    problems_data = json.loads(cleaned_response)
+                    problem_count = len(problems_data)
+                    print(f"생성된 문제 수: {problem_count}개")
+                    
+                    if self.debug:
+                        print(f"📊 문제별 세부 정보:")
+                        for i, problem in enumerate(problems_data):
+                            stimulus_count = len(problem.get('stimulus_box', {}))
+                            print(f"  문제 {i+1}: ID={problem.get('id', '?')}, 보기수={stimulus_count}")
+                    
+                    if problem_count < 8:  # 최소 8문제는 있어야 함
+                        print(f"경고: 문제 수가 부족합니다 ({problem_count}개). 더 많은 문제가 있는지 확인이 필요합니다.")
+                except json.JSONDecodeError as e:
+                    print(f"경고: JSON 파싱 실패. 응답 형식을 확인해주세요. 오류: {e}")
+                    if self.debug:
+                        print("💥 JSON 파싱 실패한 응답 내용 (처음 500자):")
+                        print(cleaned_response[:500])
+                
+                # 응답 저장
+                with open(problem_file, 'w', encoding='utf-8') as f:
+                    f.write(cleaned_response)
+                
+                print(f"문제풀이 데이터셋 저장됨: {problem_file}")
+                
+            except Exception as e:
+                print(f"문제풀이 데이터셋 생성 실패: {e}")
+                if self.debug:
+                    import traceback
+                    print("❌ 상세 오류 정보:")
+                    traceback.print_exc()
         
-        # 답안 가용성 비율 계산
-        if stats["problems"] > 0:
-            stats["answer_availability_rate"] = (stats["problems_with_answers"] / stats["problems"]) * 100
+        # 2. 개념설명 데이터셋 생성 (이미 존재하지 않는 경우만)
+        concept_file = self.response_path / f"chapter_{chapter_num}_concepts.json"
+        if not concept_file.exists():
+            print(f"\n--- 챕터 {chapter_num} 개념설명 데이터셋 생성 중 ---")
+            try:
+                concept_prompt = self.get_concept_explanation_prompt(chapter_num)
+                
+                if self.debug:
+                    print("🔍 개념설명 프롬프트 전송 중...")
+                    print("=" * 80)
+                    print("📝 개념설명 프롬프트 내용:")
+                    print("-" * 80)
+                    print(concept_prompt[:1000] + "..." if len(concept_prompt) > 1000 else concept_prompt)
+                    print("=" * 80)
+                    print("📤 Gemini API 호출 시작 (이 과정은 시간이 걸릴 수 있습니다)...")
+                
+                concept_response = self.model.generate_content(
+                    [concept_prompt] + uploaded_files,
+                    stream=True if self.debug else False,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.3,
+                        max_output_tokens=64000,
+                        top_p=0.8,
+                        top_k=40
+                    )
+                )
+                
+                if self.debug:
+                    print("📥 Gemini 실시간 응답 스트리밍 시작...")
+                    print("=" * 80)
+                    print("🤖 실시간 Gemini 개념설명 응답:")
+                    print("-" * 80)
+                    
+                    full_response = ""
+                    for chunk in concept_response:
+                        if chunk.text:
+                            print(chunk.text, end="", flush=True)
+                            full_response += chunk.text
+                    
+                    print("\n" + "=" * 80)
+                    print("📥 응답 스트리밍 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 전체 응답 길이: {len(full_response)} 문자")
+                    
+                    # 스트리밍 응답을 단일 응답 객체로 변환
+                    class ResponseWrapper:
+                        def __init__(self, text):
+                            self.text = text
+                    
+                    concept_response = ResponseWrapper(full_response)
+                else:
+                    print("📥 Gemini 응답 수신 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 원본 응답 길이: {len(concept_response.text)} 문자")
+                
+                # JSON 응답에서 코드 블록 마커 제거
+                cleaned_response = self.clean_json_response(concept_response.text)
+                
+                if self.debug:
+                    print(f"✂️ 정리된 응답 길이: {len(cleaned_response)} 문자")
+                    print("🔍 JSON 검증 중...")
+                
+                # 응답 검증
+                try:
+                    concepts_data = json.loads(cleaned_response)
+                    concept_count = len(concepts_data)
+                    print(f"생성된 개념 질문-답변 쌍 수: {concept_count}개")
+                    
+                    if self.debug:
+                        print(f"📊 개념 데이터 세부 정보:")
+                        for i, concept in enumerate(concepts_data[:3]):  # 처음 3개만 표시
+                            user_content = concept.get('messages', [{}])[1].get('content', 'N/A')[:50]
+                            print(f"  개념 {i+1}: {user_content}...")
+                        if concept_count > 3:
+                            print(f"  ... 및 {concept_count-3}개 추가")
+                    
+                    if concept_count < 300:
+                        print(f"경고: 개념 질문-답변 쌍이 300개 미만입니다 ({concept_count}개). 목표는 300개 이상입니다.")
+                        
+                except json.JSONDecodeError as e:
+                    print(f"경고: JSON 파싱 실패. 응답 형식을 확인해주세요. 오류: {e}")
+                    if self.debug:
+                        print("💥 JSON 파싱 실패한 응답 내용 (처음 500자):")
+                        print(cleaned_response[:500])
+                
+                # 응답 저장
+                with open(concept_file, 'w', encoding='utf-8') as f:
+                    f.write(cleaned_response)
+                
+                print(f"개념설명 데이터셋 저장됨: {concept_file}")
+                
+            except Exception as e:
+                print(f"개념설명 데이터셋 생성 실패: {e}")
+                if self.debug:
+                    import traceback
+                    print("❌ 상세 오류 정보:")
+                    traceback.print_exc()
         
-        return stats
+        print(f"=== 챕터 {chapter_num} 처리 완료 ===\n")
+        
+        # API 호출 간 대기시간
+        time.sleep(3)
 
-    def save_final_results(self, all_results):
-        """최종 결과 저장 (깔끔한 JSON 형식)"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    def process_concepts_only(self):
+        """모든 챕터의 개념설명 데이터셋만 처리"""
+        print("개념설명 데이터셋 생성 시작...")
         
-        # 모든 디렉토리 결과에서 JSON 데이터 추출
-        all_clean_data = []
+        # 답지 PDF를 한 번만 업로드
+        self.upload_answer_sheet_once()
         
-        for result in all_results:
-            response_text = result.get("response", "")
-            parsed_items = self.parse_gemini_response(response_text)
-            all_clean_data.extend(parsed_items)
+        # 1부터 20까지의 챕터 처리 (개념설명만)
+        for chapter_num in range(1, 21):
+            try:
+                self.process_chapter_concepts_only(chapter_num)
+            except Exception as e:
+                print(f"챕터 {chapter_num} 개념설명 처리 중 오류 발생: {e}")
+                continue
         
-        # 전체 결과 저장
-        final_output = self.output_dir / f"all_dataset_{timestamp}.json"
+        print("모든 챕터 개념설명 처리 완료!")
+
+    def process_chapter_concepts_only(self, chapter_num):
+        """특정 챕터의 개념설명 데이터셋만 처리"""
+        chapter_dir = self.base_path / f"Industrial_Tech_College_Prep_Workbook_chapter_{chapter_num}_pdf"
         
+        if not chapter_dir.exists():
+            print(f"챕터 {chapter_num} 디렉토리가 존재하지 않습니다: {chapter_dir}")
+            return
+        
+        # 개념설명 파일이 이미 존재하는지 확인
+        concept_file = self.response_path / f"chapter_{chapter_num}_concepts.json"
+        if concept_file.exists():
+            print(f"챕터 {chapter_num}의 개념설명 데이터셋이 이미 존재합니다. 건너뜁니다.")
+            return
+        
+        print(f"\n=== 챕터 {chapter_num} 개념설명 처리 시작 ===")
+        
+        # 챕터 디렉토리 내의 PDF 파일들 찾기
+        pdf_files = list(chapter_dir.glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"챕터 {chapter_num}에서 PDF 파일을 찾을 수 없습니다.")
+            return
+        
+        print(f"발견된 PDF 파일들: {[f.name for f in pdf_files]}")
+        
+        # PDF 파일들 업로드 (답지 제외)
+        uploaded_files = []
+        for pdf_file in pdf_files:
+            try:
+                # 답지가 아닌 파일만 업로드
+                if not any(keyword in pdf_file.name.lower() for keyword in ["answer", "답", "해설", "solution"]):
+                    uploaded_file = self.upload_pdf_file(pdf_file)
+                    uploaded_files.append(uploaded_file)
+            except Exception as e:
+                print(f"파일 업로드 실패 {pdf_file.name}: {e}")
+                continue
+        
+        # 답지 파일도 추가 (이미 업로드됨)
+        if self.answer_sheet_file:
+            uploaded_files.append(self.answer_sheet_file)
+        
+        if not uploaded_files:
+            print(f"챕터 {chapter_num}에서 업로드된 파일이 없습니다.")
+            return
+        
+        # 개념설명 데이터셋 생성
+        print(f"\n--- 챕터 {chapter_num} 개념설명 데이터셋 생성 중 ---")
         try:
-            with open(final_output, 'w', encoding='utf-8') as f:
-                json.dump(all_clean_data, f, ensure_ascii=False, indent=2)
+            concept_prompt = self.get_concept_explanation_prompt(chapter_num)
             
-            # JSONL 형식으로도 저장 (LLM 파인튜닝용)
-            jsonl_output = self.output_dir / f"dataset_{timestamp}.jsonl"
-            with open(jsonl_output, 'w', encoding='utf-8') as f:
-                for item in all_clean_data:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            if self.debug:
+                print("🔍 개념설명 프롬프트 전송 중...")
+                print("=" * 80)
+                print("📝 개념설명 프롬프트 내용:")
+                print("-" * 80)
+                print(concept_prompt[:1000] + "..." if len(concept_prompt) > 1000 else concept_prompt)
+                print("=" * 80)
+                print("📤 Gemini API 호출 시작 (이 과정은 시간이 걸릴 수 있습니다)...")
             
-            # 데이터셋 통계 분석
-            dataset_stats = self.analyze_dataset_statistics(all_clean_data)
+            concept_response = self.model.generate_content(
+                [concept_prompt] + uploaded_files,
+                stream=True if self.debug else False,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=64000,
+                    top_p=0.8,
+                    top_k=40
+                )
+            )
             
-            # 요약 정보 생성
-            parsed_files = [str(f) for f in self.output_dir.glob("Chapter_*.json")] + [str(f) for f in self.output_dir.glob("*_CSAT_EXAM.json")]
-            raw_files = [str(f) for f in self.output_dir.glob("*_raw_response.json")]
+            if self.debug:
+                print("📥 Gemini 실시간 응답 스트리밍 시작...")
+                print("=" * 80)
+                print("🤖 실시간 Gemini 개념설명 응답:")
+                print("-" * 80)
+                
+                full_response = ""
+                for chunk in concept_response:
+                    if chunk.text:
+                        print(chunk.text, end="", flush=True)
+                        full_response += chunk.text
+                
+                print("\n" + "=" * 80)
+                print("📥 응답 스트리밍 완료")
+                print("🧹 응답 정리 중...")
+                print(f"📄 전체 응답 길이: {len(full_response)} 문자")
+                
+                # 스트리밍 응답을 단일 응답 객체로 변환
+                class ResponseWrapper:
+                    def __init__(self, text):
+                        self.text = text
+                
+                concept_response = ResponseWrapper(full_response)
+            else:
+                print("📥 Gemini 응답 수신 완료")
+                print("🧹 응답 정리 중...")
+                print(f"📄 원본 응답 길이: {len(concept_response.text)} 문자")
             
-            summary = {
-                "total_directories": len(set(r["directory"] for r in all_results)),
-                "total_processed": len(all_results),
-                "total_items": len(all_clean_data),
-                "total_images": sum(len(r["image_files"]) for r in all_results),
-                "dataset_statistics": dataset_stats,
-                "processing_completed_at": datetime.now().isoformat(),
-                "output_files": {
-                    "json_file": str(final_output),
-                    "jsonl_file": str(jsonl_output),
-                    "parsed_data_files": parsed_files,
-                    "raw_response_files": raw_files
-                }
-            }
+            # JSON 응답에서 코드 블록 마커 제거
+            cleaned_response = self.clean_json_response(concept_response.text)
             
-            summary_file = self.output_dir / f"processing_summary_{timestamp}.json"
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, ensure_ascii=False, indent=2)
+            if self.debug:
+                print(f"✂️ 정리된 응답 길이: {len(cleaned_response)} 문자")
+                print("🔍 JSON 검증 중...")
             
-            logger.info(f"\n{'='*70}")
-            logger.info(f"🎉 모든 작업 완료!")
-            logger.info(f"{'='*70}")
-            logger.info(f"📊 처리 결과:")
-            logger.info(f"  - 디렉토리: {summary['total_directories']}개")
-            logger.info(f"  - 처리 완료: {summary['total_processed']}개")
-            logger.info(f"  - 데이터 항목: {summary['total_items']}개")
-            logger.info(f"  - 이미지: {summary['total_images']}개")
-            logger.info(f"")
-            logger.info(f"📈 데이터셋 구성:")
-            logger.info(f"  - 객관식 문제: {dataset_stats['problems']}개")
-            logger.info(f"  - 개념 설명: {dataset_stats['concepts']}개")
-            logger.info(f"")
-            logger.info(f"✅ 답안 가용성:")
-            logger.info(f"  - 답안 있음: {dataset_stats['problems_with_answers']}개")
-            logger.info(f"    ├─ 답안지 기반: {dataset_stats['problems_with_answer_key']}개")
-            logger.info(f"    └─ 문제 내 표시: {dataset_stats['problems_with_inline_answer']}개")
-            logger.info(f"  - 답안 없음: {dataset_stats['problems_without_answers']}개")
-            logger.info(f"  - 답안 가용률: {dataset_stats['answer_availability_rate']:.1f}%")
-            logger.info(f"")
-            logger.info(f"📝 해설 품질:")
-            logger.info(f"  - 상세 해설: {dataset_stats['problems_with_detailed_explanation']}개")
-            logger.info(f"  - 기본 해설: {dataset_stats['problems_with_basic_explanation']}개")
-            logger.info(f"")
-            logger.info(f"📁 출력 파일:")
-            logger.info(f"  - 전체 JSON: {final_output}")
-            logger.info(f"  - 전체 JSONL: {jsonl_output}")
-            logger.info(f"  - 파싱된 개별 파일: {len(parsed_files)}개")
-            logger.info(f"  - 원본 응답 파일: {len(raw_files)}개")
-            logger.info(f"  - 처리 요약: {summary_file}")
+            # 응답 검증
+            try:
+                concepts_data = json.loads(cleaned_response)
+                concept_count = len(concepts_data)
+                print(f"생성된 개념 질문-답변 쌍 수: {concept_count}개")
+                
+                if self.debug:
+                    print(f"📊 개념 데이터 세부 정보:")
+                    for i, concept in enumerate(concepts_data[:3]):  # 처음 3개만 표시
+                        user_content = concept.get('messages', [{}])[1].get('content', 'N/A')[:50]
+                        print(f"  개념 {i+1}: {user_content}...")
+                    if concept_count > 3:
+                        print(f"  ... 및 {concept_count-3}개 추가")
+                
+                if concept_count < 300:
+                    print(f"경고: 개념 질문-답변 쌍이 300개 미만입니다 ({concept_count}개). 목표는 300개 이상입니다.")
+                    
+            except json.JSONDecodeError as e:
+                print(f"경고: JSON 파싱 실패. 응답 형식을 확인해주세요. 오류: {e}")
+                if self.debug:
+                    print("💥 JSON 파싱 실패한 응답 내용 (처음 500자):")
+                    print(cleaned_response[:500])
+            
+            # 응답 저장
+            with open(concept_file, 'w', encoding='utf-8') as f:
+                f.write(cleaned_response)
+            
+            print(f"개념설명 데이터셋 저장됨: {concept_file}")
             
         except Exception as e:
-            logger.error(f"❌ 최종 저장 실패: {str(e)}")
+            print(f"개념설명 데이터셋 생성 실패: {e}")
+            if self.debug:
+                import traceback
+                print("❌ 상세 오류 정보:")
+                traceback.print_exc()
+        
+        print(f"=== 챕터 {chapter_num} 개념설명 처리 완료 ===\n")
+        
+        # API 호출 간 대기시간
+        time.sleep(3)
+
+    def process_all_chapters(self):
+        """모든 챕터 처리"""
+        print("데이터셋 생성 시작...")
+        
+        # 답지 PDF를 한 번만 업로드
+        self.upload_answer_sheet_once()
+        
+        # 1부터 20까지의 챕터 처리
+        for chapter_num in range(1, 21):
+            try:
+                self.process_chapter(chapter_num)
+            except Exception as e:
+                print(f"챕터 {chapter_num} 처리 중 오류 발생: {e}")
+                continue
+        
+        print("모든 챕터 처리 완료!")
+
+    def get_past_KICE_data(self):
+        """KICE 기출문제 데이터셋 생성"""
+        print("\n=== KICE 기출문제 데이터셋 생성 시작 ===")
+        
+        kice_base_path = Path("Industrial_Tech_KICE_June_Sept_Exams")
+        
+        if not kice_base_path.exists():
+            print(f"KICE 디렉토리가 존재하지 않습니다: {kice_base_path}")
+            return
+        
+        # KICE 디렉토리 내의 모든 하위 디렉토리 찾기
+        kice_subdirs = [d for d in kice_base_path.iterdir() if d.is_dir()]
+        
+        if not kice_subdirs:
+            print("KICE 하위 디렉토리를 찾을 수 없습니다.")
+            return
+        
+        print(f"발견된 KICE 시험 디렉토리: {len(kice_subdirs)}개")
+        for subdir in kice_subdirs:
+            print(f"  - {subdir.name}")
+        
+        all_kice_data = []
+        
+        # 각 하위 디렉토리 처리
+        for exam_dir in sorted(kice_subdirs):
+            exam_name = exam_dir.name
+            print(f"\n--- {exam_name} 처리 중 ---")
+            
+            # 기존 파일 존재 여부 확인
+            output_file = self.response_path / f"KICE_{exam_name}.json"
+            if output_file.exists():
+                print(f"{exam_name} 데이터셋이 이미 존재합니다. 건너뜁니다.")
+                continue
+            
+            # PDF 파일들 찾기
+            pdf_files = list(exam_dir.glob("*.pdf"))
+            
+            if not pdf_files:
+                print(f"{exam_name}에서 PDF 파일을 찾을 수 없습니다.")
+                continue
+            
+            print(f"발견된 PDF 파일들: {[f.name for f in pdf_files]}")
+            
+            # PDF 파일들 업로드
+            uploaded_files = []
+            for pdf_file in pdf_files:
+                try:
+                    uploaded_file = self.upload_pdf_file(pdf_file)
+                    uploaded_files.append(uploaded_file)
+                except Exception as e:
+                    print(f"파일 업로드 실패 {pdf_file.name}: {e}")
+                    continue
+            
+            if not uploaded_files:
+                print(f"{exam_name}에서 업로드된 파일이 없습니다.")
+                continue
+            
+            # KICE 문제 추출
+            try:
+                kice_prompt = self.get_kice_exam_prompt(exam_name)
+                
+                if self.debug:
+                    print("🔍 KICE 문제 추출 프롬프트 전송 중...")
+                    print("=" * 80)
+                    print("📝 KICE 프롬프트 내용:")
+                    print("-" * 80)
+                    print(kice_prompt[:1000] + "..." if len(kice_prompt) > 1000 else kice_prompt)
+                    print("=" * 80)
+                    print("📤 Gemini API 호출 시작...")
+                
+                kice_response = self.model.generate_content(
+                    [kice_prompt] + uploaded_files,
+                    stream=True if self.debug else False
+                )
+                
+                if self.debug:
+                    print("📥 Gemini 실시간 응답 스트리밍 시작...")
+                    print("=" * 80)
+                    print("🤖 실시간 Gemini KICE 응답:")
+                    print("-" * 80)
+                    
+                    full_response = ""
+                    for chunk in kice_response:
+                        if chunk.text:
+                            print(chunk.text, end="", flush=True)
+                            full_response += chunk.text
+                    
+                    print("\n" + "=" * 80)
+                    print("📥 응답 스트리밍 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 전체 응답 길이: {len(full_response)} 문자")
+                    
+                    # 스트리밍 응답을 단일 응답 객체로 변환
+                    class ResponseWrapper:
+                        def __init__(self, text):
+                            self.text = text
+                    
+                    kice_response = ResponseWrapper(full_response)
+                else:
+                    print("📥 Gemini 응답 수신 완료")
+                    print("🧹 응답 정리 중...")
+                    print(f"📄 원본 응답 길이: {len(kice_response.text)} 문자")
+                
+                # JSON 응답에서 코드 블록 마커 제거
+                cleaned_response = self.clean_json_response(kice_response.text)
+                
+                if self.debug:
+                    print(f"✂️ 정리된 응답 길이: {len(cleaned_response)} 문자")
+                    print("🔍 JSON 검증 중...")
+                
+                # 응답 검증
+                try:
+                    kice_data = json.loads(cleaned_response)
+                    problem_count = len(kice_data)
+                    print(f"생성된 KICE 문제 수: {problem_count}개")
+                    
+                    if self.debug:
+                        print(f"📊 KICE 문제별 세부 정보:")
+                        for i, problem in enumerate(kice_data):
+                            stimulus_count = len(problem.get('stimulus_box', {}))
+                            exam_name_check = problem.get('EXAM_NAME', '?')
+                            print(f"  문제 {i+1}: ID={problem.get('id', '?')}, 시험={exam_name_check[:30]}..., 보기수={stimulus_count}")
+                    
+                    # 전체 데이터에 추가
+                    all_kice_data.extend(kice_data)
+                    
+                except json.JSONDecodeError as e:
+                    print(f"경고: JSON 파싱 실패. 응답 형식을 확인해주세요. 오류: {e}")
+                    if self.debug:
+                        print("💥 JSON 파싱 실패한 응답 내용 (처음 500자):")
+                        print(cleaned_response[:500])
+                
+                # 개별 시험 파일로 저장
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(cleaned_response)
+                
+                print(f"KICE {exam_name} 데이터셋 저장됨: {output_file}")
+                
+            except Exception as e:
+                print(f"KICE {exam_name} 데이터셋 생성 실패: {e}")
+                if self.debug:
+                    import traceback
+                    print("❌ 상세 오류 정보:")
+                    traceback.print_exc()
+            
+            # API 호출 간 대기시간
+            time.sleep(3)
+        
+        # 전체 KICE 데이터를 하나의 파일로도 저장
+        if all_kice_data:
+            all_kice_file = self.response_path / "KICE_all_exams.json"
+            with open(all_kice_file, 'w', encoding='utf-8') as f:
+                json.dump(all_kice_data, f, ensure_ascii=False, indent=2)
+            
+            print(f"\n전체 KICE 데이터셋 저장됨: {all_kice_file}")
+            print(f"총 KICE 문제 수: {len(all_kice_data)}개")
+        
+        print("=== KICE 기출문제 데이터셋 생성 완료 ===")
+
+    def get_csat_exam_prompt(self, exam_name):
+        """CSAT 시험 데이터셋 생성을 위한 프롬프트"""
+        return f"""
+업로드된 PDF 파일들을 분석하여 다음 작업을 수행해주세요:
+
+**목표**: {exam_name} 시험의 공업일반 과목 문제들을 JSON 형식으로 추출
+
+**절대 중요**: PDF에서 찾을 수 있는 모든 공업일반 문제를 빠짐없이 추출해야 합니다. 답지는 PDF 후반부에 포함되어 있습니다.
+
+**보기(stimulus_box) 처리 절대 필수사항**:
+⚠️ 이 부분이 가장 중요합니다 ⚠️
+
+1. 문제에서 "다음 중 옳은 것만을 <보기>에서 있는 대로 고른 것은?" 같은 표현이 있으면
+2. 반드시 PDF에서 해당 문제의 <보기> 섹션을 찾아서
+3. ㄱ, ㄴ, ㄷ, ㄹ, ㅁ 등의 각 보기 내용을 stimulus_box에 포함해야 합니다
+
+**작업 지침**:
+1. PDF에서 공업일반 과목의 모든 문제를 찾아주세요
+2. 각 문제마다 <보기>가 있는지 꼼꼼히 확인하세요
+3. <보기>가 있으면 반드시 ㄱ, ㄴ, ㄷ, ㄹ 내용을 추출하세요
+4. 시험 정보를 정확히 파악하여 EXAM_NAME에 포함하세요
+5. 찾은 모든 문제를 다음 JSON 형식으로 변환해주세요. **해설(explanation)은 제외합니다.**
+
+```json
+{{
+  "id": "문제 번호",
+  "EXAM_NAME": "시험제목",
+  "question": "문제의 발문",
+  "context": "문제의 제시문 (표, 글 등)",
+  "stimulus_box": {{
+    "ㄱ": "보기 ㄱ의 실제 내용을 여기에",
+    "ㄴ": "보기 ㄴ의 실제 내용을 여기에"
+  }},
+  "options": {{
+    "①": "선택지 1번 내용",
+    "②": "선택지 2번 내용", 
+    "③": "선택지 3번 내용",
+    "④": "선택지 4번 내용",
+    "⑤": "선택지 5번 내용"
+  }},
+  "answer": {{
+    "correct_option": "정답 번호"
+  }}
+}}
+```
+
+**반드시 확인해야 할 사항들**:
+✅ **explanation 필드는 절대로 포함하지 마세요.**
+✅ 문제에 "~을 <보기>에서 고른 것은?" 표현이 있으면 → stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용 필수 포함
+✅ 보기가 진짜 없는 문제만 → stimulus_box를 빈 객체 {{}} 로 설정
+✅ PDF에서 찾을 수 있는 모든 공업일반 문제 → 빠짐없이 포함
+✅ 시험 정보를 정확히 파악하여 EXAM_NAME에 포함 (예: "2025학년도 대학수학능력시험")
+
+**최종 점검**:
+- 각 문제를 다시 한번 확인하여 <보기> 섹션이 있는데 stimulus_box가 비어있으면 안됩니다
+- <보기>에서 고른다는 표현이 있는 문제는 100% stimulus_box에 ㄱ,ㄴ,ㄷ,ㄹ 내용이 있어야 합니다
+
+응답은 반드시 유효한 JSON 배열 형식으로만 해주세요.
+2025년부터 2020년까지의 모든 CSAT 문제를 포함해야 합니다.
+"""
+
+    def get_past_csat_data(self):
+        """CSAT 기출문제 데이터셋 생성"""
+        print("\n=== CSAT 기출문제 데이터셋 생성 시작 ===")
+        
+        csat_base_path = Path("2020_2025_past_csat_exam")
+        
+        if not csat_base_path.exists():
+            print(f"CSAT 디렉토리가 존재하지 않습니다: {csat_base_path}")
+            return
+            
+        pdf_files = list(csat_base_path.glob("*.pdf"))
+        
+        if not pdf_files:
+            print("CSAT PDF 파일을 찾을 수 없습니다.")
+            return
+            
+        print(f"발견된 CSAT PDF 파일들: {[f.name for f in pdf_files]}")
+        
+        all_csat_data = []
+        
+        for pdf_file in sorted(pdf_files, reverse=True):
+            exam_name = pdf_file.stem
+            print(f"\n--- {exam_name} 처리 중 ---")
+            
+            output_file = self.response_path / f"CSAT_{exam_name}.json"
+            if output_file.exists():
+                print(f"{exam_name} 데이터셋이 이미 존재합니다. 건너뜁니다.")
+                continue
+
+            try:
+                uploaded_file = self.upload_pdf_file(pdf_file)
+                
+                csat_prompt = self.get_csat_exam_prompt(exam_name)
+                
+                if self.debug:
+                    print("🔍 CSAT 문제 추출 프롬프트 전송 중...")
+                    print("📤 Gemini API 호출 시작...")
+
+                csat_response = self.model.generate_content(
+                    [csat_prompt, uploaded_file],
+                    stream=True if self.debug else False
+                )
+                
+                full_response = ""
+                if self.debug:
+                    print("🤖 실시간 Gemini CSAT 응답:")
+                    for chunk in csat_response:
+                        if chunk.text:
+                            print(chunk.text, end="", flush=True)
+                            full_response += chunk.text
+                    print("\n📥 응답 스트리밍 완료")
+                else:
+                    for chunk in csat_response:
+                        full_response += chunk.text
+                    print("📥 Gemini 응답 수신 완료")
+
+                cleaned_response = self.clean_json_response(full_response)
+                
+                try:
+                    csat_data = json.loads(cleaned_response)
+                    print(f"생성된 CSAT 문제 수: {len(csat_data)}개")
+                    all_csat_data.extend(csat_data)
+                    
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(cleaned_response)
+                    print(f"CSAT {exam_name} 데이터셋 저장됨: {output_file}")
+
+                except json.JSONDecodeError as e:
+                    print(f"경고: JSON 파싱 실패. 오류: {e}")
+
+            except Exception as e:
+                print(f"CSAT {exam_name} 데이터셋 생성 실패: {e}")
+
+            time.sleep(3)
+
+        if all_csat_data:
+            all_csat_file = self.response_path / "CSAT_all_exams.json"
+            with open(all_csat_file, 'w', encoding='utf-8') as f:
+                json.dump(all_csat_data, f, ensure_ascii=False, indent=2)
+            print(f"\n전체 CSAT 데이터셋 저장됨: {all_csat_file}")
+            print(f"총 CSAT 문제 수: {len(all_csat_data)}개")
+            
+        print("=== CSAT 기출문제 데이터셋 생성 완료 ===")
 
 def main():
-    """메인 함수"""
+    parser = argparse.ArgumentParser(description="Gemini를 사용하여 데이터셋 생성")
+    parser.add_argument("--debug", action="store_true", help="디버그 모드 활성화")
+    parser.add_argument("--model", choices=["pro", "flash"], default="pro", 
+                       help="사용할 Gemini 모델 선택 (pro: gemini-2.5-pro, flash: gemini-2.0-flash-thinking-exp)")
+    parser.add_argument("--kice", action="store_true", help="KICE 기출문제 데이터셋만 생성")
+    parser.add_argument("--all", action="store_true", help="모든 데이터셋 생성 (챕터 + KICE)")
+    parser.add_argument("--csat", action="store_true", help="CSAT 기출문제 데이터셋만 생성")
+    parser.add_argument("--chapters", action="store_true", help="챕터별 개념설명 데이터셋만 생성")
+    args = parser.parse_args()
+    
     try:
-        logger.info("🚀 Gemini 데이터셋 생성 시작")
+        generator = DatasetGenerator(model_type=args.model, debug=args.debug)
         
-        # 환경변수 확인
-        if not os.getenv('GEMINI_API_KEY'):
-            logger.error("❌ GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
-            logger.info("다음 명령어로 API 키를 설정하세요:")
-            logger.info("export GEMINI_API_KEY='your_api_key_here'")
-            return
+        if args.debug:
+            print("🐛 디버그 모드 활성화")
+            print("📊 상세한 실행 정보가 표시됩니다")
         
-        # Gemini 데이터셋 생성기 초기화 및 실행
-        creator = GeminiDatasetCreator()
-        results = creator.process_all_directories()
-        
-        logger.info(f"🎊 작업 완료! 총 {len(results)}개의 디렉토리가 처리되었습니다.")
-        
+        if args.csat:
+            # CSAT 기출문제만 처리
+            print("🎯 CSAT 기출문제 데이터셋 생성 모드")
+            generator.get_past_csat_data()
+        elif args.chapters:
+            # 챕터별 개념설명만 처리
+            print("🎯 챕터별 개념설명 데이터셋 생성 모드")
+            generator.process_concepts_only()
+        elif args.kice:
+            # KICE 기출문제만 처리
+            print("🎯 KICE 기출문제 데이터셋 생성 모드")
+            generator.get_past_KICE_data()
+        elif args.all:
+            # 모든 데이터셋 처리
+            print("🎯 전체 데이터셋 생성 모드 (챕터 + KICE + CSAT)")
+            generator.process_all_chapters()
+            generator.get_past_KICE_data()
+            generator.get_past_csat_data()
+        else:
+            # 기본: 챕터만 처리
+            print("🎯 챕터별 데이터셋 생성 모드")
+            generator.process_all_chapters()
+            
+    except KeyError:
+        print("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+        print("다음 명령어로 API 키를 설정해주세요:")
+        print("export GEMINI_API_KEY=your_api_key_here")
     except Exception as e:
-        logger.error(f"❌ 작업 실패: {str(e)}")
-        raise
+        print(f"오류 발생: {e}")
+        if args.debug:
+            import traceback
+            print("❌ 상세 오류 정보:")
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()
