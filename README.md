@@ -18,22 +18,22 @@
 ### 📈 시각 자료
 
 #### 주요 인사이트
-![주요 인사이트](https://raw.githubusercontent.com/Chedrian07/industry_ai_for_CSAT/main/result/1.png)
+![주요 인사이트](result/1.png)
 
 #### 모델 성능 비교 분석
-![모델 성능 비교 분석](https://raw.githubusercontent.com/Chedrian07/industry_ai_for_CSAT/main/result/3.png)
+![모델 성능 비교 분석](result/3.png)
 
 #### EXAONE 모델 파인튜닝 성능 비교
-![EXAONE 모델 파인튜닝 성능 비교](https://raw.githubusercontent.com/Chedrian07/industry_ai_for_CSAT/main/result/4.png)
+![EXAONE 모델 파인튜닝 성능 비교](result/4.png)
 
 #### 전체 성능 비교
-![전체 성능 비교](https://raw.githubusercontent.com/Chedrian07/industry_ai_for_CSAT/main/result/2.png)
+![전체 성능 비교](result/2.png)
 
 ## ⚙️ 교육 데이터셋 자동 생성 시스템
 
 Gemini Vision API를 기반으로 이미지에서 텍스트를 추출하고, 이를 구조화하여 교육용 데이터셋을 자동으로 생성하는 파이프라인을 구축했습니다.
 
-![교육 데이터셋 자동 생성 시스템](https://raw.githubusercontent.com/Chedrian07/industry_ai_for_CSAT/main/result/5.png)
+![교육 데이터셋 자동 생성 시스템](result/5.png)
 
 ### 핵심 기능
 - **지능형 답안 처리**: 답안지 자동 감지, 문제-정답 매핑, 해설 추출 및 연결
